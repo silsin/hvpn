@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Cargo lock is kept for reproducible builds in binary crates
+# but you can uncomment the next line to ignore it for libraries
+# Cargo.lock
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+*.pem
+*.key
+*.crt
+config.toml
