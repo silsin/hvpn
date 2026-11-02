@@ -1,0 +1,24 @@
+[package]
+name    = "hvpn-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hvpn-server"
+path = "src/main.rs"
+
+[dependencies]
+hvpn-common    = { path = "../../crates/hvpn-common" }
+hvpn-crypto    = { path = "../../crates/hvpn-crypto" }
+hvpn-core      = { path = "../../crates/hvpn-core" }
+hvpn-obfs      = { path = "../../crates/hvpn-obfs" }
+tokio          = { workspace = true }
+tokio-tungstenite = { workspace = true }
+rustls         = { workspace = true }
+rustls-pemfile = { workspace = true }
+clap           = { workspace = true }
+anyhow         = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util   = { workspace = true }
+http           = "1.1.0"

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hvpn-common",
+    "crates/hvpn-crypto",
+    "crates/hvpn-core",
+    "crates/hvpn-tun",
+    "crates/hvpn-transport",
+    "crates/hvpn-obfs",
+    "crates/hvpn-proto",
+    "bins/hvpn-client",
+    "bins/hvpn-server",
+]
+
+[workspace.dependencies]
+tokio          = { version = "1.36.0", features = ["full"] }
+tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-webpki-roots"] }
+futures-util       = "0.3.30"
+rustls         = { version = "0.23.4", features = ["ring"] }
+rustls-pemfile = "2.1.1"
+webpki-roots   = "0.26.1"
+chacha20poly1305 = "0.10.1"
+x25519-dalek   = { version = "2.0.1", features = ["static_secrets"] }
+ed25519-dalek  = { version = "2.1.1", features = ["rand_core"] }
+hkdf           = "0.12.4"
+sha2           = "0.10.8"
+hmac           = "0.12.1"
+rand           = "0.8.5"
+serde          = { version = "1.0.197", features = ["derive"] }
+toml           = "0.8.12"
+clap           = { version = "4.5.4", features = ["derive"] }
+thiserror      = "1.0.58"
+anyhow         = "1.0.81"
+tracing        = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+bytes          = "1.6.0"
+async-trait    = "0.1.79"

@@ -1,0 +1,10 @@
+[package]
+name    = "hvpn-obfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hvpn-common = { path = "../hvpn-common" }
+tokio       = { workspace = true }
+rand        = { workspace = true }
+thiserror   = { workspace = true }

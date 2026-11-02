@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package hvpn;
+
+// Placeholder message — full definitions arrive in Phase 2.
+message HandshakeInit {
+  bytes ephemeral_pubkey = 1;
+  bytes probe_token = 2;
+}
+
+message HandshakeResponse {
+  bytes server_pubkey = 1;
+  bool accepted = 2;
+}

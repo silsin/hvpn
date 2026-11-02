@@ -1,0 +1,21 @@
+[package]
+name    = "hvpn-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hvpn-client"
+path = "src/main.rs"
+
+[dependencies]
+hvpn-common    = { path = "../../crates/hvpn-common" }
+hvpn-crypto    = { path = "../../crates/hvpn-crypto" }
+hvpn-core      = { path = "../../crates/hvpn-core" }
+hvpn-tun       = { path = "../../crates/hvpn-tun" }
+hvpn-transport = { path = "../../crates/hvpn-transport" }
+hvpn-obfs      = { path = "../../crates/hvpn-obfs" }
+tokio          = { workspace = true }
+clap           = { workspace = true }
+anyhow         = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name    = "hvpn-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hvpn-common = { path = "../hvpn-common" }
+hvpn-crypto = { path = "../hvpn-crypto" }
+tokio       = { workspace = true }
+bytes       = { workspace = true }
+thiserror   = { workspace = true }

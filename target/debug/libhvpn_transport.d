@@ -1,0 +1,1 @@
+D:\HVPN\target\debug\libhvpn_transport.rlib: D:\HVPN\crates\hvpn-common\src\config.rs D:\HVPN\crates\hvpn-common\src\error.rs D:\HVPN\crates\hvpn-common\src\lib.rs D:\HVPN\crates\hvpn-transport\src\lib.rs D:\HVPN\crates\hvpn-transport\src\transport_trait.rs D:\HVPN\crates\hvpn-transport\src\websocket.rs
