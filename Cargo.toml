@@ -8,6 +8,7 @@ members = [
     "crates/hvpn-tun",
     "crates/hvpn-transport",
     "crates/hvpn-obfs",
+    "crates/hvpn-stego",
     "crates/hvpn-metrics",
     "crates/hvpn-proto",
     "bins/hvpn-client",
