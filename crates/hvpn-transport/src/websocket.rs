@@ -15,6 +15,7 @@ use tokio_tungstenite::{
 use futures_util::{SinkExt, StreamExt};
 
 use crate::transport_trait::Transport;
+use crate::DomainFrontConfig;
 
 /// Configuration for establishing a WebSocket transport connection.
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ type WsStream = tokio_tungstenite::WebSocketStream<
 /// WebSocket transport with realistic browser-like upgrade headers.
 pub struct WebSocketTransport {
     stream: Arc<Mutex<WsStream>>,
+    pub domain_front: Option<DomainFrontConfig>,
 }
 
 impl WebSocketTransport {
@@ -102,6 +104,67 @@ impl WebSocketTransport {
 
         Ok(Self {
             stream: Arc::new(Mutex::new(ws_stream)),
+            domain_front: None,
+        })
+    }
+
+    /// Connect with domain fronting: TLS SNI uses `front_domain`, HTTP Host uses `real_host`.
+    pub async fn connect_with_domain_front(
+        cfg: &TransportConfig,
+        domain_front: DomainFrontConfig,
+    ) -> Result<Self, HvpnError> {
+        // Build URL using the fronting CDN domain for the TCP+TLS connection.
+        let url = format!(
+            "wss://{}:{}{}",
+            domain_front.front_domain, cfg.port, cfg.path
+        );
+
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| HvpnError::Transport(e.to_string()))?;
+
+        let headers = request.headers_mut();
+        // Override Host to direct traffic to the real backend through the CDN.
+        headers.insert(
+            "host",
+            domain_front.real_host.parse().unwrap(),
+        );
+        headers.insert(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("Accept", "*/*".parse().unwrap());
+        headers.insert("Accept-Language", "en-US,en;q=0.9".parse().unwrap());
+        headers.insert("Accept-Encoding", "gzip, deflate, br".parse().unwrap());
+        headers.insert("Cache-Control", "no-cache".parse().unwrap());
+        headers.insert("Pragma", "no-cache".parse().unwrap());
+        headers.insert(
+            "Origin",
+            format!("https://{}:{}", domain_front.front_domain, cfg.port)
+                .parse()
+                .unwrap(),
+        );
+
+        // TLS connector uses webpki roots; SNI is taken from the URL hostname (front_domain).
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = Connector::Rustls(Arc::new(tls_config));
+
+        let (ws_stream, _response) =
+            connect_async_tls_with_config(request, None, false, Some(connector))
+                .await
+                .map_err(|e| HvpnError::Transport(e.to_string()))?;
+
+        Ok(Self {
+            stream: Arc::new(Mutex::new(ws_stream)),
+            domain_front: Some(domain_front),
         })
     }
 }
