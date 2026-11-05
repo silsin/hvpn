@@ -3,7 +3,13 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+#[cfg(target_os = "windows")]
+mod service;
+#[cfg(target_os = "windows")]
+mod install;
 
 use hvpn_common::{Config, RelayHopConfig};
 use hvpn_core::{Frame, FrameCodec, FrameType};
@@ -74,12 +80,96 @@ impl AppState {
     }
 }
 
-// ── Control socket (Unix only) ─────────────────────────────────────────────────
+// ── Control command dispatch (platform-independent) ───────────────────────────
+
+/// Dispatch a single JSON control command against the shared state.
+///
+/// Shared by the Unix-socket and Windows named-pipe control listeners so that
+/// the command set stays identical across platforms.
+fn dispatch(cmd: &serde_json::Value, state: &Arc<Mutex<AppState>>) -> serde_json::Value {
+    use serde_json::{json, Value};
+
+    let cmd_str = match cmd.get("cmd").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return json!({"ok": false, "error": "missing 'cmd' field"}),
+    };
+
+    match cmd_str {
+        "status" => {
+            let s = state.lock().unwrap();
+            json!({
+                "ok": true,
+                "status": {
+                    "connected": s.connected,
+                    "transport": s.transport_kind.to_string(),
+                    "rtt_ms": s.rtt_ms,
+                    "bytes_in": s.bytes_in,
+                    "bytes_out": s.bytes_out,
+                    "active_streams": s.active_streams,
+                }
+            })
+        }
+        "connect" => {
+            let path = cmd
+                .get("config")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut s = state.lock().unwrap();
+            s.connected = true;
+            s.config_path = path;
+            json!({"ok": true})
+        }
+        "disconnect" => {
+            let mut s = state.lock().unwrap();
+            s.connected = false;
+            json!({"ok": true})
+        }
+        "switch-transport" => {
+            let kind_str = match cmd.get("kind").and_then(Value::as_str) {
+                Some(k) => k,
+                None => return json!({"ok": false, "error": "missing 'kind' field"}),
+            };
+            let kind = match kind_str {
+                "websocket" => TransportKind::WebSocket,
+                "http2" => TransportKind::Http2,
+                "grpc" => TransportKind::Grpc,
+                other => {
+                    return json!({"ok": false, "error": format!("unknown transport kind '{other}'")})
+                }
+            };
+            let mut s = state.lock().unwrap();
+            s.transport_kind = kind;
+            json!({"ok": true})
+        }
+        "relay-add" => {
+            let address = match cmd.get("address").and_then(Value::as_str) {
+                Some(a) => a.to_string(),
+                None => return json!({"ok": false, "error": "missing 'address' field"}),
+            };
+            let pubkey_hex = match cmd.get("pubkey_hex").and_then(Value::as_str) {
+                Some(k) => k.to_string(),
+                None => return json!({"ok": false, "error": "missing 'pubkey_hex' field"}),
+            };
+            let mut s = state.lock().unwrap();
+            s.relay_chain.push(RelayHopConfig { address, pubkey_hex });
+            json!({"ok": true})
+        }
+        "relay-clear" => {
+            let mut s = state.lock().unwrap();
+            s.relay_chain.clear();
+            json!({"ok": true})
+        }
+        other => json!({"ok": false, "error": format!("unknown command '{other}'")}),
+    }
+}
+
+// ── Control socket ─────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
 mod control {
     use super::AppState;
-    use serde_json::{json, Value};
+    use serde_json::Value;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -130,97 +220,83 @@ mod control {
         buf_reader.read_line(&mut line).await?;
         let cmd: Value = serde_json::from_str(line.trim())?;
 
-        let response = dispatch(&cmd, &state);
+        let response = super::dispatch(&cmd, &state);
 
         let mut resp_line = serde_json::to_string(&response)?;
         resp_line.push('\n');
         writer.write_all(resp_line.as_bytes()).await?;
         Ok(())
     }
+}
 
-    fn dispatch(cmd: &Value, state: &Arc<Mutex<AppState>>) -> Value {
-        let cmd_str = match cmd.get("cmd").and_then(Value::as_str) {
-            Some(s) => s,
-            None => return json!({"ok": false, "error": "missing 'cmd' field"}),
-        };
+#[cfg(windows)]
+mod control {
+    use super::AppState;
+    use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use tracing::{error, info, warn};
 
-        match cmd_str {
-            "status" => {
-                let s = state.lock().unwrap();
-                json!({
-                    "ok": true,
-                    "status": {
-                        "connected": s.connected,
-                        "transport": s.transport_kind.to_string(),
-                        "rtt_ms": s.rtt_ms,
-                        "bytes_in": s.bytes_in,
-                        "bytes_out": s.bytes_out,
-                        "active_streams": s.active_streams,
-                    }
-                })
+    /// Named pipe the daemon listens on: `\\.\pipe\hvpn`.
+    const PIPE_NAME: &str = r"\\.\pipe\hvpn";
+
+    pub async fn listen_control_socket(state: Arc<Mutex<AppState>>) {
+        info!("control socket listening on named pipe {}", PIPE_NAME);
+
+        loop {
+            // Create a fresh named-pipe server instance each iteration so we can
+            // service one client per instance concurrently.
+            let server = match ServerOptions::new().create(PIPE_NAME) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("failed to create named pipe {}: {}", PIPE_NAME, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            // Block until a client connects.
+            if let Err(e) = server.connect().await {
+                warn!("named pipe connect error: {}", e);
+                continue;
             }
-            "connect" => {
-                let path = cmd
-                    .get("config")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let mut s = state.lock().unwrap();
-                s.connected = true;
-                s.config_path = path;
-                json!({"ok": true})
-            }
-            "disconnect" => {
-                let mut s = state.lock().unwrap();
-                s.connected = false;
-                json!({"ok": true})
-            }
-            "switch-transport" => {
-                let kind_str = match cmd.get("kind").and_then(Value::as_str) {
-                    Some(k) => k,
-                    None => return json!({"ok": false, "error": "missing 'kind' field"}),
-                };
-                let kind = match kind_str {
-                    "websocket" => super::TransportKind::WebSocket,
-                    "http2" => super::TransportKind::Http2,
-                    "grpc" => super::TransportKind::Grpc,
-                    other => {
-                        return json!({"ok": false, "error": format!("unknown transport kind '{other}'")})
-                    }
-                };
-                let mut s = state.lock().unwrap();
-                s.transport_kind = kind;
-                json!({"ok": true})
-            }
-            "relay-add" => {
-                let address = match cmd.get("address").and_then(Value::as_str) {
-                    Some(a) => a.to_string(),
-                    None => return json!({"ok": false, "error": "missing 'address' field"}),
-                };
-                let pubkey_hex = match cmd.get("pubkey_hex").and_then(Value::as_str) {
-                    Some(k) => k.to_string(),
-                    None => return json!({"ok": false, "error": "missing 'pubkey_hex' field"}),
-                };
-                let mut s = state.lock().unwrap();
-                s.relay_chain.push(super::RelayHopConfig { address, pubkey_hex });
-                json!({"ok": true})
-            }
-            "relay-clear" => {
-                let mut s = state.lock().unwrap();
-                s.relay_chain.clear();
-                json!({"ok": true})
-            }
-            other => json!({"ok": false, "error": format!("unknown command '{other}'")}),
+
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(server, state).await {
+                    warn!("control connection error: {}", e);
+                }
+            });
         }
+    }
+
+    async fn handle_connection(
+        stream: tokio::net::windows::named_pipe::NamedPipeServer,
+        state: Arc<Mutex<AppState>>,
+    ) -> anyhow::Result<()> {
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+
+        buf_reader.read_line(&mut line).await?;
+        let cmd: Value = serde_json::from_str(line.trim())?;
+
+        let response = super::dispatch(&cmd, &state);
+
+        let mut resp_line = serde_json::to_string(&response)?;
+        resp_line.push('\n');
+        writer.write_all(resp_line.as_bytes()).await?;
+        Ok(())
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod control {
     use super::AppState;
     use std::sync::{Arc, Mutex};
 
-    /// No-op stub on non-Unix platforms.
+    /// No-op stub on unsupported platforms.
     pub async fn listen_control_socket(_state: Arc<Mutex<AppState>>) {
         // Control socket not supported on this platform.
     }
@@ -238,14 +314,60 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Windows: handle service / install / uninstall flags before normal CLI
+    // parsing, since the Windows service manager launches us with these flags.
+    #[cfg(target_os = "windows")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--service") {
+            // Run the service control dispatcher on this (main) thread.
+            return service::run().map_err(|e| anyhow::anyhow!("service error: {:?}", e));
+        }
+        if args.iter().any(|a| a == "--install") {
+            install::install_service()
+                .map_err(|e| anyhow::anyhow!("install error: {:?}", e))?;
+            println!("HVPN Client service installed.");
+            return Ok(());
+        }
+        if args.iter().any(|a| a == "--uninstall") {
+            install::uninstall_service()
+                .map_err(|e| anyhow::anyhow!("uninstall error: {:?}", e))?;
+            println!("HVPN Client service uninstalled.");
+            return Ok(());
+        }
+    }
+
     let cli = Cli::parse();
 
-    // Load configuration.
-    let cfg = Config::load_and_validate(cli.config.to_str().unwrap_or("config.toml"))
-        .unwrap_or_else(|e| {
-            eprintln!("[hvpn-client] configuration error:\n{}", e);
-            std::process::exit(1);
+    // Graceful shutdown token; cancelled by Ctrl+C in interactive mode.
+    let shutdown = CancellationToken::new();
+    {
+        let token = shutdown.clone();
+        tokio::spawn(async move {
+            if signal::ctrl_c().await.is_ok() {
+                info!("received Ctrl+C, shutting down");
+                token.cancel();
+            }
         });
+    }
+
+    run_client(&cli.config.to_string_lossy(), shutdown).await
+}
+
+/// Core client loop shared by the interactive and Windows-service entry points.
+///
+/// Runs the control socket listener, performs the handshake, connects the
+/// transport, and pumps packets through the TUN device until `shutdown` is
+/// cancelled.
+pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Result<()> {
+    // Load configuration.
+    let cfg = match Config::load_and_validate(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[hvpn-client] configuration error:\n{}", e);
+            return Err(anyhow::anyhow!("configuration error: {}", e));
+        }
+    };
 
     info!(
         server = %cfg.server_address,
@@ -302,12 +424,12 @@ async fn main() -> Result<()> {
         }
     };
 
-    info!("entering tunnel loop (Ctrl+C to exit)");
+    info!("entering tunnel loop (stop signal to exit)");
 
-    // Main tunnel loop — graceful shutdown on Ctrl+C.
+    // Main tunnel loop — graceful shutdown on the cancellation token.
     let result = tokio::select! {
-        _ = signal::ctrl_c() => {
-            info!("received Ctrl+C, shutting down");
+        _ = shutdown.cancelled() => {
+            info!("shutdown requested, stopping");
             Ok(())
         }
         res = tunnel_loop(
