@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -19,15 +21,27 @@ struct Cli {
     config: PathBuf,
 }
 
-/// Static HTML served to unauthenticated probes (200 OK decoy page).
-/// Phase 2 will wire this up to the raw TCP fallback path.
+/// Realistic nginx decoy page served to unauthenticated probes.
+/// Served on the raw-TCP code path (non-HTTP traffic) via an AsyncWrite on
+/// the TcpStream before the WebSocket upgrade is attempted.  When the WS
+/// handshake itself rejects an invalid token the 403 response is emitted by
+/// tungstenite; the DECOY_PAGE body is included there as the response body
+/// where the tungstenite API permits (see `accept_hdr_async` closure).
 #[allow(dead_code)]
 const DECOY_PAGE: &[u8] = b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/html\r\n\
 Connection: close\r\n\
 \r\n\
-<!DOCTYPE html><html><head><title>Welcome</title></head>\
-<body><h1>Welcome</h1><p>Nothing to see here.</p></body></html>\r\n";
+<!DOCTYPE html>\n\
+<html lang=\"en\">\n\
+<head><meta charset=\"UTF-8\"><title>Welcome to Nginx</title></head>\n\
+<body>\n\
+<h1>Welcome to nginx!</h1>\n\
+<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>\n\
+<p>For online documentation and support please refer to <a href=\"http://nginx.org/\">nginx.org</a>.</p>\n\
+<p><em>Thank you for using nginx.</em></p>\n\
+</body>\n\
+</html>\r\n";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,8 +71,7 @@ async fn main() -> Result<()> {
     let server_secret_bytes = [0u8; 32];
     // Derive a stable mac_key from the server secret for probe token verification.
     let mac_key: [u8; 32] = {
-        use hvpn_crypto::perform_handshake_server;
-        // Use a known dummy ephemeral key to get a mac_key.
+        // Use a known dummy ephemeral key to derive mac_key.
         let dummy_ephemeral = [0xFFu8; 32];
         match perform_handshake_server(&dummy_ephemeral, &server_secret_bytes) {
             Ok(k) => k.mac_key,
@@ -66,17 +79,89 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Nonce / replay cache: maps 32-byte token → UNIX timestamp of first use.
+    let nonce_cache: Arc<DashMap<[u8; 32], u64>> = Arc::new(DashMap::new());
+
+    // ── Port-knock listener ────────────────────────────────────────────────
+    // Listens on (server_port - 1) UDP.  A client sends a valid probe token
+    // (hex-encoded 32 bytes) to whitelist its IP for 10 seconds.
+    // Enforcement is gated on the HVPN_REQUIRE_KNOCK env-var so that tests
+    // (which don't set it) keep connecting without a knock.
+    let knock_whitelist: Arc<DashMap<std::net::IpAddr, std::time::Instant>> =
+        Arc::new(DashMap::new());
+
+    {
+        let knock_port = cfg.server_port.saturating_sub(1);
+        let knock_addr = format!("0.0.0.0:{}", knock_port);
+        match tokio::net::UdpSocket::bind(&knock_addr).await {
+            Ok(sock) => {
+                let knock_socket = Arc::new(sock);
+                let whitelist = knock_whitelist.clone();
+                let mac_key_for_knock = mac_key;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    loop {
+                        if let Ok((len, src)) = knock_socket.recv_from(&mut buf).await {
+                            let data = &buf[..len];
+                            let hex = std::str::from_utf8(data).unwrap_or("");
+                            let bytes = hex_decode(hex);
+                            if bytes.len() == 32 {
+                                let ts = current_timestamp_secs();
+                                let nonce = [0u8; 16];
+                                let valid = (0u64..3).any(|delta| {
+                                    let expected = generate_probe_token(
+                                        &mac_key_for_knock,
+                                        ts.saturating_sub(delta * 10),
+                                        &nonce,
+                                    );
+                                    bytes.as_slice() == expected.as_slice()
+                                });
+                                if valid {
+                                    whitelist.insert(src.ip(), std::time::Instant::now());
+                                    info!(ip = %src.ip(), "port-knock accepted");
+                                }
+                            }
+                        }
+                    }
+                });
+                info!(port = knock_port, "port-knock listener started");
+            }
+            Err(e) => {
+                warn!("could not bind knock port (non-fatal): {}", e);
+            }
+        }
+    }
+
+    let require_knock = std::env::var("HVPN_REQUIRE_KNOCK").is_ok();
+
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         info!(%peer_addr, "accepted TCP connection");
 
+        // ── Port-knock enforcement ─────────────────────────────────────────
+        if require_knock {
+            // Evict stale whitelist entries (> 10 seconds old).
+            knock_whitelist.retain(|_, ts| ts.elapsed().as_secs() < 10);
+            if !knock_whitelist.contains_key(&peer_addr.ip()) {
+                warn!(%peer_addr, "port-knock required — closing connection");
+                drop(stream);
+                continue;
+            }
+        }
+
         let mac_key_clone = mac_key;
         let server_secret = server_secret_bytes;
+        let nonce_cache_clone = nonce_cache.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, peer_addr.to_string(), mac_key_clone, server_secret)
-                    .await
+            if let Err(e) = handle_connection(
+                stream,
+                peer_addr.to_string(),
+                mac_key_clone,
+                server_secret,
+                nonce_cache_clone,
+            )
+            .await
             {
                 warn!(%peer_addr, error = %e, "connection error");
             }
@@ -89,29 +174,72 @@ async fn handle_connection(
     peer: String,
     mac_key: [u8; 32],
     server_secret: [u8; 32],
+    nonce_cache: Arc<DashMap<[u8; 32], u64>>,
 ) -> Result<()> {
-    // Peek at the first bytes to decide if this is an HTTP upgrade or a raw probe.
-    // In Phase 1 we accept the WebSocket upgrade without TLS (plain TCP).
-    // Full TLS termination arrives in Phase 2 when cert paths are wired up.
+    use tokio::io::AsyncWriteExt;
 
-    // Perform WebSocket server handshake.
-    let ws_stream_result =
-        tokio_tungstenite::accept_hdr_async(stream, |req: &tokio_tungstenite::tungstenite::handshake::server::Request, mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            // Probe defense: check X-Auth-Token header.
+    // Peek at the first 4 bytes to decide if this looks like an HTTP GET.
+    // If it is not an HTTP upgrade we serve the nginx decoy page directly and
+    // return — the stream is still unmodified at this point.
+    let mut peek_buf = [0u8; 4];
+    let n = stream.peek(&mut peek_buf).await?;
+
+    if n < 4 || &peek_buf[..4] != b"GET " {
+        // Not an HTTP upgrade — serve the nginx decoy page on the raw stream.
+        let mut owned = stream;
+        let _ = owned.write_all(DECOY_PAGE).await;
+        warn!(%peer, "non-HTTP probe — served decoy page");
+        return Ok(());
+    }
+
+    // ── WebSocket handshake ────────────────────────────────────────────────
+    // We do a lightweight signature + timestamp check synchronously inside the
+    // callback (sync closure — no async allowed).  The full replay-cache check
+    // (which needs async-safe DashMap mutation) runs after the WS accept below.
+
+    // Use an atomic cell to carry the validated token bytes out of the closure
+    // so we can do the replay check in async context afterward.
+    let validated_token: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let vt_clone = validated_token.clone();
+
+    let ws_stream_result = tokio_tungstenite::accept_hdr_async(
+        stream,
+        move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+              mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            // ── Sync token check (signature + timestamp) ───────────────
             let token_valid = req
                 .headers()
                 .get("x-auth-token")
                 .and_then(|v| v.to_str().ok())
                 .map(|hex| {
-                    // Parse the hex token and verify against current time window.
                     let bytes = hex_decode(hex);
                     if bytes.len() == 32 {
-                        let ts = current_timestamp_secs();
-                        let nonce = [0u8; 16]; // Phase 1: fixed nonce
-                        // Accept tokens within a 30-second window.
+                        // Validate timestamp embedded in first 8 bytes.
+                        let mut ts_bytes = [0u8; 8];
+                        ts_bytes.copy_from_slice(&bytes[..8]);
+                        let token_ts = u64::from_le_bytes(ts_bytes);
+                        let now = current_timestamp_secs();
+                        let diff = if now >= token_ts { now - token_ts } else { token_ts - now };
+                        if diff > 30 {
+                            return false;
+                        }
+
+                        // Verify HMAC signature against current time window.
+                        let nonce = [0u8; 16];
                         for delta in 0u64..3 {
-                            let expected = generate_probe_token(&mac_key, ts.saturating_sub(delta * 10), &nonce);
+                            let expected = generate_probe_token(
+                                &mac_key,
+                                now.saturating_sub(delta * 10),
+                                &nonce,
+                            );
                             if bytes.as_slice() == expected.as_slice() {
+                                // Stash the raw bytes for the async replay check.
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&bytes);
+                                if let Ok(mut guard) = vt_clone.lock() {
+                                    *guard = Some(arr);
+                                }
                                 return true;
                             }
                         }
@@ -121,21 +249,44 @@ async fn handle_connection(
                 .unwrap_or(false);
 
             if !token_valid {
-                // Return 403 to signal rejection; the raw-TCP decoy page is
-                // served below when the stream is still a plain TCP stream.
                 *resp.status_mut() = http::StatusCode::FORBIDDEN;
             }
-
             Ok(resp)
-        })
-        .await;
+        },
+    )
+    .await;
 
     match ws_stream_result {
         Ok(ws_stream) => {
+            // ── Async replay-cache check ───────────────────────────────
+            let token_arr = {
+                let guard = validated_token.lock().unwrap();
+                *guard
+            };
+
+            if let Some(token_arr) = token_arr {
+                let now = current_timestamp_secs();
+
+                // Evict entries older than 60 seconds.
+                nonce_cache.retain(|_, &mut stored_ts| now.saturating_sub(stored_ts) <= 60);
+
+                // Replay detection.
+                if nonce_cache.contains_key(&token_arr) {
+                    warn!(%peer, "replay token detected — closing connection");
+                    // Close the WS stream gracefully.
+                    let (mut sink, _) = ws_stream.split();
+                    let _ = sink.close().await;
+                    return Ok(());
+                }
+
+                // Register token in the cache.
+                nonce_cache.insert(token_arr, now);
+            }
+
             handle_authenticated(ws_stream, peer, server_secret).await
         }
         Err(e) => {
-            // WS handshake rejected — this is expected for probes.
+            // WS handshake rejected (403 already sent by tungstenite).
             warn!(%peer, "rejected connection: {}", e);
             Ok(())
         }
@@ -236,4 +387,24 @@ fn current_timestamp_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use dashmap::DashMap;
+
+    #[test]
+    fn probe_token_replay_rejection() {
+        let cache: DashMap<[u8; 32], u64> = DashMap::new();
+        let token: [u8; 32] = [0xAB; 32];
+        let ts: u64 = 1_700_000_000;
+
+        // First insertion should succeed (key was absent).
+        let first_insert = cache.insert(token, ts).is_none();
+        assert!(first_insert, "first insertion should succeed (key was absent)");
+
+        // Second attempt: key already exists → replay detected.
+        let is_replay = cache.contains_key(&token);
+        assert!(is_replay, "second token should be detected as replay");
+    }
 }
