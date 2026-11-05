@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/hvpn-common",
     "crates/hvpn-crypto",
+    "crates/hvpn-pq",
     "crates/hvpn-core",
     "crates/hvpn-tun",
     "crates/hvpn-transport",
