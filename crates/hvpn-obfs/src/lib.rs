@@ -1,5 +1,6 @@
 //! Obfuscation engine: traffic padding and timing jitter.
 
+use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use rand::{Rng, SeedableRng};
 use tokio::time::{sleep, Duration};
 
@@ -17,6 +18,7 @@ const JITTER_MAX_MS: u64 = 20;
 /// traffic-analysis-based deep-packet inspection.
 pub struct ObfsEngine {
     rng: rand::rngs::StdRng,
+    pub shaping: ShapingState,
 }
 
 impl ObfsEngine {
@@ -24,6 +26,7 @@ impl ObfsEngine {
     pub fn new() -> Self {
         Self {
             rng: rand::rngs::StdRng::from_entropy(),
+            shaping: ShapingState::new(),
         }
     }
 
@@ -85,12 +88,136 @@ impl ObfsEngine {
         let clamped = sample.max(0.0).min(JITTER_MAX_MS as f64);
         clamped.round() as u64
     }
+
+    /// Compute the delay to apply before sending a packet of `packet_size` bytes
+    /// according to the traffic profile.
+    pub fn shape_delay(&mut self, profile: TrafficProfile, packet_size: usize) -> Duration {
+        match profile {
+            TrafficProfile::Browser => {
+                if self.shaping.burst_count < 8 {
+                    self.shaping.burst_count += 1;
+                    Duration::from_millis(0)
+                } else {
+                    self.shaping.burst_count = 0;
+                    let ms = self.rng.gen_range(50u64..=200u64);
+                    Duration::from_millis(ms)
+                }
+            }
+            TrafficProfile::Streaming => {
+                // 2 Mbps = 2_000_000 bits/sec
+                let bits = (packet_size as f64) * 8.0;
+                let secs = bits / 2_000_000.0;
+                Duration::from_secs_f64(secs)
+            }
+            TrafficProfile::Voip => Duration::from_millis(20),
+            TrafficProfile::Idle => Duration::from_millis(5_000),
+        }
+    }
+
+    /// Compress data with flate2 deflate. Prepend 0x01 if compressed,
+    /// 0x00 if not (compression did not help).
+    pub fn normalize_entropy(&self, data: Vec<u8>) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(1));
+        encoder.write_all(&data).ok();
+        let compressed = encoder.finish().unwrap_or_default();
+
+        if compressed.len() < data.len() {
+            let mut out = Vec::with_capacity(1 + compressed.len());
+            out.push(0x01u8);
+            out.extend_from_slice(&compressed);
+            out
+        } else {
+            let mut out = Vec::with_capacity(1 + data.len());
+            out.push(0x00u8);
+            out.extend_from_slice(&data);
+            out
+        }
+    }
+
+    /// Decompress or pass through based on the flag byte.
+    pub fn denormalize_entropy(&self, data: Vec<u8>) -> Result<Vec<u8>, hvpn_common::HvpnError> {
+        use std::io::Read;
+
+        if data.is_empty() {
+            return Err(hvpn_common::HvpnError::Protocol("empty input to denormalize".into()));
+        }
+        let flag = data[0];
+        let payload = &data[1..];
+        match flag {
+            0x01 => {
+                let mut decoder = DeflateDecoder::new(payload);
+                let mut out = Vec::new();
+                decoder.read_to_end(&mut out)
+                    .map_err(|e| hvpn_common::HvpnError::Protocol(e.to_string()))?;
+                Ok(out)
+            }
+            0x00 => Ok(payload.to_vec()),
+            _ => Err(hvpn_common::HvpnError::Protocol("unknown entropy flag".into())),
+        }
+    }
 }
 
 impl Default for ObfsEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Traffic shaping profile
+// ---------------------------------------------------------------------------
+
+use hvpn_common::ObfsProfile;
+
+/// Traffic profile used to shape inter-packet delays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrafficProfile {
+    Browser,
+    Streaming,
+    Voip,
+    Idle,
+}
+
+impl From<ObfsProfile> for TrafficProfile {
+    fn from(p: ObfsProfile) -> Self {
+        match p {
+            ObfsProfile::Browser   => TrafficProfile::Browser,
+            ObfsProfile::Streaming => TrafficProfile::Streaming,
+            ObfsProfile::Voip      => TrafficProfile::Voip,
+            ObfsProfile::Idle      => TrafficProfile::Idle,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shaping state
+// ---------------------------------------------------------------------------
+
+use std::time::Instant;
+
+/// Per-connection state for traffic shaping.
+pub struct ShapingState {
+    pub last_send: Option<Instant>,
+    pub bytes_this_window: u64,
+    pub window_start: Instant,
+    pub burst_count: u32,
+}
+
+impl ShapingState {
+    pub fn new() -> Self {
+        ShapingState {
+            last_send: None,
+            bytes_this_window: 0,
+            window_start: Instant::now(),
+            burst_count: 0,
+        }
+    }
+}
+
+impl Default for ShapingState {
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]
@@ -136,5 +263,35 @@ mod tests {
         )
         .await
         .expect("jitter timed out");
+    }
+
+    #[test]
+    fn test_entropy_normalize_roundtrip() {
+        let engine = ObfsEngine::new();
+        // 1000 bytes of repetitive data — deflate should compress well.
+        let original: Vec<u8> = (0u8..=99).cycle().take(1000).collect();
+        let normalized = engine.normalize_entropy(original.clone());
+        let recovered = engine.denormalize_entropy(normalized).expect("denormalize failed");
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn test_traffic_shaping_voip() {
+        let mut engine = ObfsEngine::new();
+        let delay = engine.shape_delay(TrafficProfile::Voip, 160);
+        assert_eq!(delay, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn test_browser_burst() {
+        let mut engine = ObfsEngine::new();
+        // First 8 calls must all return zero delay.
+        for i in 0..8 {
+            let d = engine.shape_delay(TrafficProfile::Browser, 100);
+            assert_eq!(d, Duration::ZERO, "call {} should be 0ms", i + 1);
+        }
+        // 9th call triggers the pause (50–200 ms).
+        let d = engine.shape_delay(TrafficProfile::Browser, 100);
+        assert!(d >= Duration::from_millis(50), "9th call should be >= 50ms, got {:?}", d);
     }
 }
