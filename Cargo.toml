@@ -11,6 +11,7 @@ members = [
     "crates/hvpn-stego",
     "crates/hvpn-metrics",
     "crates/hvpn-proto",
+    "crates/hvpn-relay",
     "bins/hvpn-client",
     "bins/hvpn-server",
 ]
