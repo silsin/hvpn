@@ -15,6 +15,16 @@ pub enum ObfsProfile {
     Idle,
 }
 
+/// A single hop in an onion relay chain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayHopConfig {
+    /// Address of the relay node (hostname or IP with optional port).
+    pub address: String,
+
+    /// Hex-encoded 32-byte public key of the relay node.
+    pub pubkey_hex: String,
+}
+
 /// Top-level HVPN configuration loaded from `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -30,6 +40,42 @@ pub struct Config {
     /// Obfuscation profile to apply to the tunnel traffic.
     #[serde(default)]
     pub obfs_profile: ObfsProfile,
+
+    /// Optional onion relay chain. `None` means direct connection; `Some` enables multi-hop routing.
+    #[serde(default)]
+    pub relay_chain: Option<Vec<RelayHopConfig>>,
+
+    /// Enable steganographic transport layer.
+    #[serde(default)]
+    pub stego_mode: bool,
+
+    /// Enable post-quantum hybrid KEM handshake.
+    #[serde(default)]
+    pub post_quantum: bool,
+
+    /// Enable server-side NAT routing.
+    #[serde(default)]
+    pub nat_enabled: bool,
+
+    /// IP address assigned to the TUN interface (e.g. "10.8.0.2").
+    #[serde(default = "default_tun_ip")]
+    pub tun_ip: String,
+
+    /// Netmask for the TUN interface (e.g. "255.255.255.0").
+    #[serde(default = "default_tun_netmask")]
+    pub tun_netmask: String,
+
+    /// DNS servers to use over the tunnel (e.g. ["1.1.1.1", "8.8.8.8"]).
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+}
+
+fn default_tun_ip() -> String {
+    "10.8.0.2".to_string()
+}
+
+fn default_tun_netmask() -> String {
+    "255.255.255.0".to_string()
 }
 
 impl Config {
