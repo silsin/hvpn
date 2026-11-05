@@ -505,16 +505,38 @@ pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Resul
         match WinTunDevice::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address).await {
             Ok(dev) => {
                 info!("WinTun device opened successfully");
+                // Wait for the WinTun adapter to fully initialise before touching the routing table.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 // Set default route through the VPN tunnel using server-side TUN IP as gateway.
                 match hvpn_tun::set_default_route("hvpn0", "10.8.0.1") {
-                    Ok(_) => info!("default route set through VPN tunnel"),
+                    Ok(_) => info!("default route set through VPN tunnel OK"),
                     Err(e) => {
                         tracing::warn!("set_default_route failed: {}", e);
+                        // Try direct API as last resort
+                        if let Ok(idx) = hvpn_tun::get_interface_index("hvpn0") {
+                            info!("hvpn0 interface index = {}", idx);
+                            match hvpn_tun::set_interface_metric(idx, 1) {
+                                Ok(_) => info!("interface metric set to 1"),
+                                Err(e) => tracing::warn!("set_interface_metric failed: {}", e),
+                            }
+                        } else {
+                            tracing::warn!("could not find hvpn0 interface index");
+                        }
                     }
                 }
                 // Set DNS servers.
                 if !cfg.dns_servers.is_empty() {
                     let _ = hvpn_tun::set_dns("hvpn0", &cfg.dns_servers);
+                }
+                // Log the default routes so we can confirm the VPN route was installed.
+                match std::process::Command::new("route").arg("print").output() {
+                    Ok(out) => {
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        for line in text.lines().filter(|l| l.contains("0.0.0.0")) {
+                            info!("route: {}", line.trim());
+                        }
+                    }
+                    Err(e) => tracing::warn!("could not run `route print`: {}", e),
                 }
                 Box::new(dev)
             }

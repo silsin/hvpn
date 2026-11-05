@@ -225,13 +225,23 @@ pub fn get_interface_index(iface_name: &str) -> Result<u32, HvpnError> {
 /// Set a fixed metric on a network interface, disabling automatic metric selection.
 pub fn set_interface_metric(iface_index: u32, metric: u32) -> Result<(), HvpnError> {
     use windows::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceIndexToLuid,
         GetIpInterfaceEntry, SetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
     };
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows::Win32::Networking::WinSock::AF_INET;
     use windows::Win32::Foundation::NO_ERROR;
 
+    // Get the InterfaceLuid for this interface — required by SetIpInterfaceEntry.
+    let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+    let conv_result = unsafe { ConvertInterfaceIndexToLuid(iface_index, &mut luid) };
+    if conv_result != NO_ERROR {
+        return Err(HvpnError::Tun(format!("ConvertInterfaceIndexToLuid failed: {:?}", conv_result)));
+    }
+
     let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
     row.Family = AF_INET;
+    row.InterfaceLuid = luid;
     row.InterfaceIndex = iface_index;
 
     let result = unsafe { GetIpInterfaceEntry(&mut row) };
@@ -239,8 +249,8 @@ pub fn set_interface_metric(iface_index: u32, metric: u32) -> Result<(), HvpnErr
         return Err(HvpnError::Tun(format!("GetIpInterfaceEntry failed: {:?}", result)));
     }
 
-    row.Metric = metric;
     row.UseAutomaticMetric = false.into();
+    row.Metric = metric;
 
     let result = unsafe { SetIpInterfaceEntry(&mut row) };
     if result != NO_ERROR {
@@ -250,57 +260,72 @@ pub fn set_interface_metric(iface_index: u32, metric: u32) -> Result<(), HvpnErr
 }
 
 /// Install a default route (`0.0.0.0/0`) through the WinTun interface using the
-/// Windows IP Helper API. This avoids the metric problems caused by `route add`.
+/// Windows IP Helper API (`CreateIpForwardEntry2` / `MIB_IPFORWARD_ROW2`).
 pub fn set_default_route(iface_name: &str, gateway_ip: &str) -> Result<(), HvpnError> {
     use windows::Win32::NetworkManagement::IpHelper::{
-        CreateIpForwardEntry, DeleteIpForwardEntry, GetIpForwardTable,
-        MIB_IPFORWARDROW, MIB_IPFORWARDTABLE,
+        ConvertInterfaceIndexToLuid, CreateIpForwardEntry2, DeleteIpForwardEntry2,
+        FreeMibTable, GetIpForwardTable2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
     };
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows::Win32::Networking::WinSock::{AF_INET, NL_ROUTE_PROTOCOL};
+    use windows::Win32::Foundation::NO_ERROR;
     use std::net::Ipv4Addr;
 
     let iface_index = get_interface_index(iface_name)?;
 
-    let gw_addr: Ipv4Addr = gateway_ip.parse()
+    let gw_addr: Ipv4Addr = gateway_ip
+        .parse()
         .map_err(|_| HvpnError::Tun(format!("invalid gateway IP: {}", gateway_ip)))?;
-    // Windows DWORD fields store IPv4 addresses in network byte order (big-endian).
-    let gw_dword = u32::from_be_bytes(gw_addr.octets());
 
-    // Delete any existing 0.0.0.0/0 routes through this interface.
-    let mut table_size: u32 = 0;
-    let _ = unsafe { GetIpForwardTable(None, &mut table_size, false) };
-    let mut table_buf: Vec<u8> = vec![0u8; table_size as usize];
-    let ret = unsafe {
-        GetIpForwardTable(
-            Some(table_buf.as_mut_ptr() as *mut MIB_IPFORWARDTABLE),
-            &mut table_size,
-            false,
-        )
-    };
-    if ret == 0 {
-        let table = table_buf.as_ptr() as *const MIB_IPFORWARDTABLE;
-        let n_rows = unsafe { (*table).dwNumEntries } as usize;
-        let rows_ptr = unsafe { (*table).table.as_ptr() };
-        for i in 0..n_rows {
-            let row = unsafe { &*rows_ptr.add(i) };
-            if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardIfIndex == iface_index {
-                let _ = unsafe { DeleteIpForwardEntry(row as *const MIB_IPFORWARDROW) };
-            }
-        }
+    // Get the interface LUID from the index.
+    let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+    let conv_result = unsafe { ConvertInterfaceIndexToLuid(iface_index, &mut luid) };
+    if conv_result != NO_ERROR {
+        return Err(HvpnError::Tun(format!(
+            "ConvertInterfaceIndexToLuid failed: {:?}",
+            conv_result
+        )));
     }
 
-    // Build the new default route entry.
-    let mut row: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
-    row.dwForwardDest     = 0;   // 0.0.0.0
-    row.dwForwardMask     = 0;   // 0.0.0.0
-    row.dwForwardNextHop  = gw_dword;
-    row.dwForwardIfIndex  = iface_index;
-    row.dwForwardMetric1  = 1;
-    row.Anonymous1.dwForwardType     = 4;   // MIB_IPROUTE_TYPE_INDIRECT
-    row.Anonymous2.dwForwardProto    = 3;   // MIB_IPPROTO_NETMGMT
+    // Delete any existing 0.0.0.0/0 routes on this interface.
+    let mut table_ptr = std::ptr::null_mut();
+    let get_result = unsafe { GetIpForwardTable2(AF_INET, &mut table_ptr) };
+    if get_result == NO_ERROR && !table_ptr.is_null() {
+        let n_rows = unsafe { (*table_ptr).NumEntries } as usize;
+        let rows_ptr = unsafe { (*table_ptr).Table.as_ptr() };
+        for i in 0..n_rows {
+            let row = unsafe { &*rows_ptr.add(i) };
+            if row.DestinationPrefix.PrefixLength == 0 && row.InterfaceIndex == iface_index {
+                let _ = unsafe { DeleteIpForwardEntry2(row as *const MIB_IPFORWARD_ROW2) };
+            }
+        }
+        unsafe { FreeMibTable(table_ptr as *const std::ffi::c_void) };
+    }
 
-    let ret = unsafe { CreateIpForwardEntry(&row) };
-    if ret != 0 {
-        return Err(HvpnError::Tun(format!("CreateIpForwardEntry failed: {}", ret)));
+    // Build and install the new default route.
+    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    unsafe { InitializeIpForwardEntry(&mut row) };
+
+    row.InterfaceLuid = luid;
+    row.InterfaceIndex = iface_index;
+    row.DestinationPrefix.PrefixLength = 0;
+    // 0.0.0.0/0 destination — Ipv4 is a union variant, requiring unsafe
+    row.DestinationPrefix.Prefix.si_family = AF_INET;
+    row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+    row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = 0u32;
+    // Next-hop gateway
+    row.NextHop.si_family = AF_INET;
+    row.NextHop.Ipv4.sin_family = AF_INET;
+    row.NextHop.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(gw_addr.octets());
+    row.Metric = 1;
+    // MIB_IPPROTO_NETMGMT = 3 (NL_ROUTE_PROTOCOL newtype wrapping i32)
+    row.Protocol = NL_ROUTE_PROTOCOL(3);
+    row.ValidLifetime = 0xFFFF_FFFFu32;
+    row.PreferredLifetime = 0xFFFF_FFFFu32;
+
+    let result = unsafe { CreateIpForwardEntry2(&row) };
+    if result != NO_ERROR {
+        return Err(HvpnError::Tun(format!("CreateIpForwardEntry2 failed: {:?}", result)));
     }
     Ok(())
 }
@@ -318,10 +343,10 @@ pub fn exclude_server_route(server_ip: &str, gateway: &str) -> Result<(), HvpnEr
         .map_err(|_| HvpnError::Tun(format!("invalid server IP: {}", server_ip)))?;
     let gw_addr: Ipv4Addr = gateway.parse()
         .map_err(|_| HvpnError::Tun(format!("invalid gateway: {}", gateway)))?;
-    let srv_dword = u32::from_be_bytes(srv_addr.octets());
-    let gw_dword  = u32::from_be_bytes(gw_addr.octets());
-    // 255.255.255.255 — all octets 0xFF so byte order is irrelevant.
-    let host_mask_dword = u32::from_be_bytes([255, 255, 255, 255]);
+    // MIB_IPFORWARDROW uses host byte order (little-endian on x86).
+    let srv_dword = u32::from_ne_bytes(srv_addr.octets());
+    let gw_dword  = u32::from_ne_bytes(gw_addr.octets());
+    let host_mask_dword = u32::from_ne_bytes([255, 255, 255, 255]);
 
     // Find the physical interface index and remove any stale server host route.
     let mut phys_iface_index: u32 = 0;
@@ -361,10 +386,15 @@ pub fn exclude_server_route(server_ip: &str, gateway: &str) -> Result<(), HvpnEr
     row.dwForwardDest     = srv_dword;
     row.dwForwardMask     = host_mask_dword;
     row.dwForwardNextHop  = gw_dword;
-    row.dwForwardIfIndex  = phys_iface_index; // 0 is acceptable; Windows will pick the right one
+    row.dwForwardIfIndex  = phys_iface_index;
     row.dwForwardMetric1  = 1;
-    row.Anonymous1.dwForwardType     = 4; // MIB_IPROUTE_TYPE_INDIRECT
-    row.Anonymous2.dwForwardProto    = 3; // MIB_IPPROTO_NETMGMT
+    row.dwForwardMetric2  = u32::MAX;
+    row.dwForwardMetric3  = u32::MAX;
+    row.dwForwardMetric4  = u32::MAX;
+    row.dwForwardMetric5  = u32::MAX;
+    row.Anonymous1.dwForwardType     = 4;
+    row.Anonymous2.dwForwardProto    = 3;
+    row.dwForwardAge      = u32::MAX;
 
     let ret = unsafe { CreateIpForwardEntry(&row) };
     if ret != 0 {
