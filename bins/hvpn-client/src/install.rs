@@ -99,3 +99,35 @@ pub fn uninstall_service() -> windows_service::Result<()> {
 
     Ok(())
 }
+
+// ── WinTun auto-download ───────────────────────────────────────────────────────
+
+/// Download wintun.dll next to the executable if it is not already present.
+/// Called at startup before the TUN device is opened.
+#[cfg(target_os = "windows")]
+pub fn ensure_wintun() -> anyhow::Result<()> {
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine exe directory"))?
+        .to_path_buf();
+    let dll_path = exe_dir.join("wintun.dll");
+    if dll_path.exists() {
+        return Ok(());
+    }
+    println!("[hvpn-client] wintun.dll not found — downloading...");
+    let url = "https://www.wintun.net/builds/wintun-0.14.1.zip";
+    let bytes = reqwest::blocking::get(url)?.bytes()?;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor)?;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let name = file.name().to_string();
+        if name.ends_with("amd64/wintun.dll") {
+            let mut out = std::fs::File::create(&dll_path)?;
+            std::io::copy(&mut file, &mut out)?;
+            println!("[hvpn-client] wintun.dll installed to {:?}", dll_path);
+            return Ok(());
+        }
+    }
+    anyhow::bail!("wintun.dll not found in downloaded zip")
+}

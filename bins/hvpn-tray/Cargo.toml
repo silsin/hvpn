@@ -19,3 +19,6 @@ tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+wry = "0.43.0"
+dirs = "5.0.1"
+hvpn-common = { path = "../../crates/hvpn-common" }

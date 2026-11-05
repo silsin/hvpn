@@ -8,3 +8,4 @@ serde     = { workspace = true }
 toml      = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+base64    = "0.22.1"

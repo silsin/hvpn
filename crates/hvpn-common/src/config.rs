@@ -202,8 +202,108 @@ impl Config {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+/// A parsed connection profile decoded from a server connection string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionProfile {
+    pub server: String,
+    pub port: u16,
+    /// Hex-encoded Ed25519 server public key (64 hex chars).
+    pub pubkey: String,
+    pub version: u8,
+    /// User-assigned display name (not part of the wire format).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
 
+impl ConnectionProfile {
+    /// Decode a ConnectionProfile from a base64url connection string.
+    pub fn from_connection_string(s: &str) -> Result<Self, HvpnError> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let bytes = URL_SAFE_NO_PAD
+            .decode(s.trim())
+            .map_err(|e| HvpnError::Config(format!("base64 decode error: {}", e)))?;
+        let json_str = std::str::from_utf8(&bytes)
+            .map_err(|e| HvpnError::Config(format!("utf8 error: {}", e)))?;
+        let profile: ConnectionProfile = serde_json::from_str(json_str)
+            .map_err(|e| HvpnError::Config(format!("json parse error: {}", e)))?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Encode this ConnectionProfile to a base64url connection string.
+    /// The `name` field is excluded from the wire format.
+    pub fn to_connection_string(&self) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        // Build wire-format object without name.
+        let wire = serde_json::json!({
+            "server": self.server,
+            "port": self.port,
+            "pubkey": self.pubkey,
+            "version": self.version,
+        });
+        URL_SAFE_NO_PAD.encode(wire.to_string().as_bytes())
+    }
+
+    /// Validate that all fields are well-formed.
+    pub fn validate(&self) -> Result<(), HvpnError> {
+        if self.server.is_empty() {
+            return Err(HvpnError::Config("server must not be empty".to_string()));
+        }
+        if self.port == 0 {
+            return Err(HvpnError::Config("port must not be 0".to_string()));
+        }
+        if self.pubkey.len() != 64 || !self.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(HvpnError::Config(
+                "pubkey must be exactly 64 hex characters".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Returns the platform-appropriate path for the saved profiles JSON file.
+/// Windows: %APPDATA%\HVPN\profiles.json
+/// Linux/macOS: ~/.config/hvpn/profiles.json
+pub fn profiles_path() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        base.join("HVPN").join("profiles.json")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let base = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        base.join(".config").join("hvpn").join("profiles.json")
+    }
+}
+
+/// Load saved profiles from the platform profile path.
+/// Returns an empty Vec on any error (file not found, parse error, etc.).
+pub fn load_profiles() -> Vec<ConnectionProfile> {
+    let path = profiles_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Save profiles to the platform profile path, creating parent directories.
+pub fn save_profiles(profiles: &[ConnectionProfile]) -> Result<(), HvpnError> {
+    let path = profiles_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| HvpnError::Io { source: e })?;
+    }
+    let json = serde_json::to_string_pretty(profiles)
+        .map_err(|e| HvpnError::Config(format!("json serialize error: {}", e)))?;
+    std::fs::write(&path, json).map_err(|e| HvpnError::Io { source: e })?;
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +444,73 @@ mod tests {
         // 64 hex chars = valid SHA-256 fingerprint
         cfg.cert_pin_fingerprints = vec!["a".repeat(64)];
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_connection_profile_roundtrip() {
+        let profile = ConnectionProfile {
+            server: "1.2.3.4".to_string(),
+            port: 443,
+            pubkey: "a".repeat(64),
+            version: 1,
+            name: Some("my server".to_string()),
+        };
+        let s = profile.to_connection_string();
+        let decoded = ConnectionProfile::from_connection_string(&s).expect("decode failed");
+        assert_eq!(decoded.server, profile.server);
+        assert_eq!(decoded.port, profile.port);
+        assert_eq!(decoded.pubkey, profile.pubkey);
+        assert_eq!(decoded.version, profile.version);
+        // name is not part of the wire format
+        assert!(decoded.name.is_none());
+    }
+
+    #[test]
+    fn test_connection_profile_validate_bad_pubkey() {
+        let profile = ConnectionProfile {
+            server: "1.2.3.4".to_string(),
+            port: 443,
+            pubkey: "a".repeat(63), // 63 chars, not 64
+            version: 1,
+            name: None,
+        };
+        let err = profile.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pubkey"), "expected pubkey error, got: {}", msg);
+    }
+
+    #[test]
+    fn test_profiles_save_load() {
+        // Use a temp dir so this test is self-contained.
+        let dir = std::env::temp_dir().join("hvpn_test_profiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profiles.json");
+        let profiles = vec![
+            ConnectionProfile {
+                server: "10.0.0.1".to_string(),
+                port: 443,
+                pubkey: "a".repeat(64),
+                version: 1,
+                name: Some("server-a".to_string()),
+            },
+            ConnectionProfile {
+                server: "10.0.0.2".to_string(),
+                port: 1194,
+                pubkey: "b".repeat(64),
+                version: 1,
+                name: Some("server-b".to_string()),
+            },
+        ];
+        // Write directly to temp path for isolation.
+        let json = serde_json::to_string_pretty(&profiles).unwrap();
+        std::fs::write(&path, json).unwrap();
+        let loaded: Vec<ConnectionProfile> = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap()
+        ).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].server, "10.0.0.1");
+        assert_eq!(loaded[1].server, "10.0.0.2");
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
     }
 }

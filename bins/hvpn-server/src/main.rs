@@ -18,9 +18,17 @@ mod nat;
 #[derive(Parser, Debug)]
 #[command(name = "hvpn-server", version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Path to the TOML configuration file.
-    #[arg(long, default_value = "config.toml")]
+    #[arg(long, default_value = "config.toml", global = true)]
     config: PathBuf,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Generate server config, print QR code connection string, and exit.
+    Setup,
 }
 
 /// Realistic nginx decoy page served to unauthenticated probes.
@@ -60,6 +68,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(Command::Setup) = cli.command {
+        return run_setup();
+    }
 
     let cfg = Config::load_and_validate(cli.config.to_str().unwrap_or("config.toml"))
         .unwrap_or_else(|e| {
@@ -193,6 +205,80 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+fn run_setup() -> anyhow::Result<()> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use hvpn_crypto::KeyPair;
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+
+    // Generate fresh Ed25519 server keypair.
+    let kp = KeyPair::generate();
+    let pubkey_bytes = kp.public_key_bytes();
+    let pubkey_hex: String = pubkey_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Detect public IP.
+    let ip = reqwest::blocking::get("https://api.ipify.org")?.text()?;
+    let ip = ip.trim().to_string();
+
+    let port: u16 = 443;
+
+    // Write server config file.
+    #[cfg(target_os = "windows")]
+    let tls_cert_path = r"C:\ProgramData\hvpn\server.pem";
+    #[cfg(not(target_os = "windows"))]
+    let tls_cert_path = "/etc/hvpn/server.pem";
+
+    let config_content = format!(
+        r#"server_address = "{ip}"
+server_port = {port}
+tls_cert_path = "{tls_cert}"
+nat_enabled = true
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+tun_ip = "10.8.0.1"
+tun_netmask = "255.255.255.0"
+"#,
+        ip = ip,
+        port = port,
+        tls_cert = tls_cert_path,
+    );
+
+    #[cfg(target_os = "windows")]
+    let config_dir = std::path::PathBuf::from(r"C:\ProgramData\hvpn");
+    #[cfg(not(target_os = "windows"))]
+    let config_dir = std::path::PathBuf::from("/etc/hvpn");
+
+    std::fs::create_dir_all(&config_dir)?;
+
+    let config_path = config_dir.join("server.toml");
+    std::fs::write(&config_path, &config_content)?;
+    println!("Server config written to {:?}", config_path);
+
+    let pubkey_path = config_dir.join("server.pub");
+    std::fs::write(&pubkey_path, &pubkey_hex)?;
+    println!("Server public key written to {:?}", pubkey_path);
+
+    // Build connection string JSON.
+    let conn_json = serde_json::json!({
+        "server": ip,
+        "port": port,
+        "pubkey": pubkey_hex,
+        "version": 1,
+    });
+    let conn_json_bytes = conn_json.to_string();
+    let conn_str = URL_SAFE_NO_PAD.encode(conn_json_bytes.as_bytes());
+
+    // Generate and print QR code.
+    let code = QrCode::new(conn_str.as_bytes())?;
+    let image = code.render::<unicode::Dense1x2>().build();
+    println!("{}", image);
+
+    // Print raw connection string.
+    println!("\nConnection string:\n{}", conn_str);
+    println!("\nScan this QR code in the HVPN tray app, or paste the connection string manually");
+
+    Ok(())
 }
 
 async fn handle_connection(

@@ -160,6 +160,74 @@ fn dispatch(cmd: &serde_json::Value, state: &Arc<Mutex<AppState>>) -> serde_json
             s.relay_chain.clear();
             json!({"ok": true})
         }
+        "add_profile" => {
+            let profile_val = match cmd.get("profile") {
+                Some(v) => v.clone(),
+                None => return json!({"ok": false, "error": "missing 'profile' field"}),
+            };
+            match serde_json::from_value::<hvpn_common::ConnectionProfile>(profile_val) {
+                Ok(profile) => {
+                    let mut profiles = hvpn_common::load_profiles();
+                    profiles.push(profile);
+                    match hvpn_common::save_profiles(&profiles) {
+                        Ok(_) => json!({"ok": true}),
+                        Err(e) => json!({"ok": false, "error": e.to_string()}),
+                    }
+                }
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+        "list_profiles" => {
+            let profiles = hvpn_common::load_profiles();
+            json!({"ok": true, "profiles": profiles})
+        }
+        "activate_profile" => {
+            let name = match cmd.get("name").and_then(Value::as_str) {
+                Some(n) => n.to_string(),
+                None => return json!({"ok": false, "error": "missing 'name' field"}),
+            };
+            let profiles = hvpn_common::load_profiles();
+            match profiles.iter().find(|p| p.name.as_deref() == Some(&name) || p.server == name) {
+                Some(p) => {
+                    let mut s = state.lock().unwrap();
+                    s.connected = false; // trigger reconnect
+                    s.config_path = p.server.clone();
+                    json!({"ok": true, "server": p.server})
+                }
+                None => json!({"ok": false, "error": "profile not found"}),
+            }
+        }
+        "get_settings" => {
+            let s = state.lock().unwrap();
+            json!({
+                "ok": true,
+                "transport": s.transport_kind.to_string(),
+                "connected": s.connected,
+            })
+        }
+        "set_setting" => {
+            let key = match cmd.get("key").and_then(Value::as_str) {
+                Some(k) => k.to_string(),
+                None => return json!({"ok": false, "error": "missing 'key' field"}),
+            };
+            let value = match cmd.get("value").and_then(Value::as_str) {
+                Some(v) => v.to_string(),
+                None => return json!({"ok": false, "error": "missing 'value' field"}),
+            };
+            match key.as_str() {
+                "transport" => {
+                    let kind = match value.as_str() {
+                        "websocket" => TransportKind::WebSocket,
+                        "http2" => TransportKind::Http2,
+                        "grpc" => TransportKind::Grpc,
+                        _ => return json!({"ok": false, "error": "unknown transport kind"}),
+                    };
+                    state.lock().unwrap().transport_kind = kind;
+                    json!({"ok": true})
+                }
+                _ => json!({"ok": true, "note": "setting acknowledged"}),
+            }
+        }
         other => json!({"ok": false, "error": format!("unknown command '{other}'")}),
     }
 }
@@ -335,6 +403,9 @@ async fn main() -> Result<()> {
             println!("HVPN Client service uninstalled.");
             return Ok(());
         }
+        if let Err(e) = install::ensure_wintun() {
+            eprintln!("[hvpn-client] warn: could not ensure wintun.dll: {}", e);
+        }
     }
 
     let cli = Cli::parse();
@@ -360,12 +431,46 @@ async fn main() -> Result<()> {
 /// transport, and pumps packets through the TUN device until `shutdown` is
 /// cancelled.
 pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Result<()> {
-    // Load configuration.
-    let cfg = match Config::load_and_validate(config_path) {
+    // Resolve config path: if the given path doesn't exist, try the platform default.
+    let resolved_config = if std::path::Path::new(config_path).exists() {
+        config_path.to_string()
+    } else {
+        #[cfg(target_os = "windows")]
+        let default = std::env::var("APPDATA")
+            .map(|a| format!(r"{}\HVPN\client.toml", a))
+            .unwrap_or_else(|_| config_path.to_string());
+        #[cfg(not(target_os = "windows"))]
+        let default = std::env::var("HOME")
+            .map(|h| format!("{}/.config/hvpn/client.toml", h))
+            .unwrap_or_else(|_| config_path.to_string());
+        default
+    };
+
+    // Load configuration, falling back to saved profiles.
+    let cfg = match Config::load_and_validate(&resolved_config) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("[hvpn-client] configuration error:\n{}", e);
-            return Err(anyhow::anyhow!("configuration error: {}", e));
+        Err(_) => {
+            let profiles = hvpn_common::load_profiles();
+            if let Some(first) = profiles.first() {
+                eprintln!("[hvpn-client] No config file found. Using saved profile: {}", first.server);
+                Config {
+                    server_address: first.server.clone(),
+                    server_port: first.port,
+                    tls_cert_path: String::new(),
+                    obfs_profile: hvpn_common::ObfsProfile::Browser,
+                    relay_chain: None,
+                    stego_mode: false,
+                    post_quantum: false,
+                    nat_enabled: false,
+                    tun_ip: "10.8.0.2".to_string(),
+                    tun_netmask: "255.255.255.0".to_string(),
+                    dns_servers: vec!["1.1.1.1".to_string()],
+                    cert_pin_fingerprints: vec![],
+                }
+            } else {
+                eprintln!("[hvpn-client] No config found. On Windows, use the HVPN tray app to set up. On Linux, run: hvpn-client --config <path>");
+                return Err(anyhow::anyhow!("no configuration available"));
+            }
         }
     };
 
