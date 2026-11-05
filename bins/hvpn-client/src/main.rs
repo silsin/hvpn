@@ -6,6 +6,11 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+// Install the ring crypto provider for rustls at process startup.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[cfg(target_os = "windows")]
 mod service;
 #[cfg(target_os = "windows")]
@@ -374,6 +379,7 @@ mod control {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_crypto_provider();
     // Initialise structured logging.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -466,6 +472,7 @@ pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Resul
                     tun_netmask: "255.255.255.0".to_string(),
                     dns_servers: vec!["1.1.1.1".to_string()],
                     cert_pin_fingerprints: vec![],
+                    use_tls: false,
                 }
             } else {
                 eprintln!("[hvpn-client] No config found. On Windows, use the HVPN tray app to set up. On Linux, run: hvpn-client --config <path>");
@@ -513,7 +520,11 @@ pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Resul
 
     // Attempt to connect; log and exit gracefully on failure (server may not
     // be running in Phase 1 testing).
-    let transport_result = WebSocketTransport::connect(&transport_cfg).await;
+    let transport_result = if cfg.use_tls {
+        WebSocketTransport::connect(&transport_cfg).await
+    } else {
+        WebSocketTransport::connect_plain(&transport_cfg).await
+    };
     let transport: Option<WebSocketTransport> = match transport_result {
         Ok(t) => {
             info!("WebSocket transport connected");

@@ -21,6 +21,7 @@ tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-util     = "0.7"
 serde_json     = { workspace = true }
+rustls         = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.7.0"

@@ -150,6 +150,61 @@ pub struct WebSocketTransport {
 }
 
 impl WebSocketTransport {
+    /// Connect to `ws://host:port/path` without TLS (plain WebSocket).
+    pub async fn connect_plain(cfg: &TransportConfig) -> Result<Self, HvpnError> {
+        use tokio_tungstenite::connect_async;
+        let url = format!("ws://{}:{}{}", cfg.host, cfg.port, cfg.path);
+
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| HvpnError::Transport(e.to_string()))?;
+
+        // Phase 1: use a fixed shared mac_key that matches the server's fallback.
+        // The server derives mac_key via HKDF from a zeroed ECDH shared secret.
+        // Both sides use the same zeroed input → same HKDF output.
+        let mac_key: [u8; 32] = {
+            use hkdf::Hkdf;
+            use sha2::Sha512;
+            let shared_secret = [0u8; 32]; // zeroed server secret + zeroed ephemeral = zero shared
+            let hk = Hkdf::<Sha512>::new(None, &shared_secret);
+            let mut okm = [0u8; 128];
+            let _ = hk.expand(b"HVPN-v1-session-keys", &mut okm);
+            let mut mac_key = [0u8; 32];
+            mac_key.copy_from_slice(&okm[96..128]);
+            mac_key
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let nonce = [0u8; 16];
+        let token = hvpn_crypto::generate_probe_token(&mac_key, ts, &nonce);
+        let token_hex: String = token.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let headers = request.headers_mut();
+        headers.insert("X-Auth-Token", token_hex.parse().unwrap());
+        headers.insert(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("Accept", "*/*".parse().unwrap());
+        headers.insert("Accept-Language", "en-US,en;q=0.9".parse().unwrap());
+        headers.insert("Cache-Control", "no-cache".parse().unwrap());
+
+        let (ws_stream, _response) = connect_async(request)
+            .await
+            .map_err(|e| HvpnError::Transport(e.to_string()))?;
+
+        Ok(Self {
+            stream: Arc::new(Mutex::new(ws_stream)),
+            domain_front: None,
+        })
+    }
+
     /// Connect to `wss://host:port/path` with browser-like headers.
     pub async fn connect(cfg: &TransportConfig) -> Result<Self, HvpnError> {
         let url = format!("wss://{}:{}{}", cfg.host, cfg.port, cfg.path);

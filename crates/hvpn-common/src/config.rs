@@ -38,6 +38,7 @@ pub struct Config {
     pub server_port: u16,
 
     /// Path to the TLS certificate (PEM) used for server verification or pinning.
+    #[serde(default)]
     pub tls_cert_path: String,
 
     /// Obfuscation profile to apply to the tunnel traffic.
@@ -77,6 +78,11 @@ pub struct Config {
     /// matches one of these fingerprints.
     #[serde(default)]
     pub cert_pin_fingerprints: Vec<String>,
+
+    /// Use TLS for the transport connection. Set to false when the server
+    /// does not have a TLS certificate (plain WebSocket).
+    #[serde(default = "default_use_tls")]
+    pub use_tls: bool,
 }
 
 fn default_tun_ip() -> String {
@@ -85,6 +91,10 @@ fn default_tun_ip() -> String {
 
 fn default_tun_netmask() -> String {
     "255.255.255.0".to_string()
+}
+
+fn default_use_tls() -> bool {
+    true
 }
 
 /// Returns `true` if `s` consists entirely of lowercase hex characters and has the given length.
@@ -323,6 +333,7 @@ mod tests {
             tun_netmask: "255.255.255.0".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
             cert_pin_fingerprints: vec![],
+            use_tls: true,
         }
     }
 
@@ -405,6 +416,7 @@ mod tests {
             tun_netmask: "255.255.255.0".to_string(),
             dns_servers: vec![],
             cert_pin_fingerprints: vec![],
+            use_tls: true,
         };
         let errs = cfg.validate().unwrap_err();
         assert!(

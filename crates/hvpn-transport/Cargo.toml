@@ -13,6 +13,7 @@ rustls                = { workspace = true }
 rustls-pemfile        = { workspace = true }
 webpki-roots          = { workspace = true }
 sha2                  = { workspace = true }
+hkdf                  = { workspace = true }
 thiserror             = { workspace = true }
 async-trait           = { workspace = true }
 futures-util          = { workspace = true }
