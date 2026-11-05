@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Obfuscation traffic-shaping profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObfsProfile {
     /// Mimic browser HTTPS traffic patterns.
+    #[default]
     Browser,
     /// Mimic video/audio streaming traffic patterns.
     Streaming,
@@ -12,12 +13,6 @@ pub enum ObfsProfile {
     Voip,
     /// Mimic an idle keep-alive connection.
     Idle,
-}
-
-impl Default for ObfsProfile {
-    fn default() -> Self {
-        Self::Browser
-    }
 }
 
 /// Top-level HVPN configuration loaded from `config.toml`.

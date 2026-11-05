@@ -203,6 +203,7 @@ async fn handle_connection(
         Arc::new(std::sync::Mutex::new(None));
     let vt_clone = validated_token.clone();
 
+    #[allow(clippy::result_large_err)]
     let ws_stream_result = tokio_tungstenite::accept_hdr_async(
         stream,
         move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
@@ -220,7 +221,7 @@ async fn handle_connection(
                         ts_bytes.copy_from_slice(&bytes[..8]);
                         let token_ts = u64::from_le_bytes(ts_bytes);
                         let now = current_timestamp_secs();
-                        let diff = if now >= token_ts { now - token_ts } else { token_ts - now };
+                        let diff = now.abs_diff(token_ts);
                         if diff > 30 {
                             return false;
                         }

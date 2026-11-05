@@ -72,7 +72,7 @@ impl RatchetState {
         self.send_count += 1;
 
         // Every 64 packets: re-key from the root.
-        if self.send_count % 64 == 0 {
+        if self.send_count.is_multiple_of(64) {
             let mut out = [0u8; 64];
             hkdf_expand(&self.root_key, &self.send_chain_key, b"sym-ratchet", &mut out);
             self.root_key.copy_from_slice(&out[0..32]);
@@ -98,7 +98,7 @@ impl RatchetState {
         self.recv_count += 1;
 
         // Every 64 packets: re-key from the root.
-        if self.recv_count % 64 == 0 {
+        if self.recv_count.is_multiple_of(64) {
             let mut out = [0u8; 64];
             hkdf_expand(&self.root_key, &self.recv_chain_key, b"sym-ratchet", &mut out);
             self.root_key.copy_from_slice(&out[0..32]);
