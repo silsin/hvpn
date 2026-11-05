@@ -5,14 +5,14 @@ use async_trait::async_trait;
 use hvpn_common::HvpnError;
 use std::fs::OpenOptions;
 use std::os::unix::io::{AsRawFd, RawFd};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::tun_trait::TunDevice;
 
 // Linux ioctl constants for TUN/TAP
 const TUNSETIFF: u64 = 0x400454CA;
-const IFF_TUN:  i16 = 0x0001;
+const IFF_TUN: i16 = 0x0001;
 const IFF_NO_PI: i16 = 0x1000;
 
 /// Represents the ifreq structure used by TUNSETIFF ioctl.
@@ -26,17 +26,23 @@ struct Ifreq {
 /// Linux TUN device backed by `/dev/net/tun`.
 pub struct LinuxTun {
     file: File,
-    #[allow(dead_code)]
-    iface_name: String,
+    /// Actual kernel interface name, e.g. `"hvpn0"`.
+    ifname: String,
 }
 
 impl LinuxTun {
     /// Open and configure a new TUN device.
     ///
-    /// `iface_name` is the desired interface name (e.g. `"hvpn0"`). If the
-    /// name is an empty string the kernel assigns one automatically.
-    pub async fn open(iface_name: &str) -> Result<Self, HvpnError> {
-        // Open /dev/net/tun.
+    /// - `iface_name` — desired interface name (e.g. `"hvpn0"`); empty means kernel-assigned.
+    /// - `tun_ip`     — CIDR address to assign to the interface, e.g. `"10.8.0.2/24"`.
+    /// - `server_ip`  — VPN server's real IP; will be routed outside the TUN so the tunnel
+    ///                  itself does not recurse.
+    pub async fn open(
+        iface_name: &str,
+        tun_ip: &str,
+        server_ip: &str,
+    ) -> Result<Self, HvpnError> {
+        // ── 1. Open /dev/net/tun ─────────────────────────────────────────────
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -45,7 +51,7 @@ impl LinuxTun {
 
         let raw_fd: RawFd = file.as_raw_fd();
 
-        // Build the ifreq struct.
+        // ── 2. TUNSETIFF ─────────────────────────────────────────────────────
         let mut ifr = Ifreq {
             ifr_name: [0u8; 16],
             ifr_flags: IFF_TUN | IFF_NO_PI,
@@ -55,7 +61,6 @@ impl LinuxTun {
         let copy_len = name_bytes.len().min(15);
         ifr.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-        // Issue TUNSETIFF ioctl.
         let ret = unsafe { libc_ioctl(raw_fd, TUNSETIFF, &ifr as *const Ifreq as u64) };
         if ret < 0 {
             return Err(HvpnError::Tun(format!(
@@ -64,8 +69,8 @@ impl LinuxTun {
             )));
         }
 
-        // Determine actual interface name.
-        let actual_name = std::str::from_utf8(
+        // Determine actual interface name assigned by the kernel.
+        let ifname = std::str::from_utf8(
             ifr.ifr_name.split(|&b| b == 0).next().unwrap_or(&[]),
         )
         .unwrap_or("unknown")
@@ -74,18 +79,119 @@ impl LinuxTun {
         // Convert to async Tokio file.
         let async_file = File::from_std(file);
 
-        Ok(Self {
+        let tun = Self {
             file: async_file,
-            iface_name: actual_name,
-        })
+            ifname,
+        };
+
+        // ── 3. IP / routing setup ────────────────────────────────────────────
+        tun.configure_interface(tun_ip, server_ip)?;
+
+        Ok(tun)
+    }
+
+    /// Assign address, bring the interface up, and install routes.
+    fn configure_interface(&self, tun_ip: &str, server_ip: &str) -> Result<(), HvpnError> {
+        // 3a. Assign IP address  (tun_ip must be in CIDR form, e.g. "10.8.0.2/24")
+        run_cmd("ip", &["addr", "add", tun_ip, "dev", &self.ifname])?;
+
+        // 3b. Bring the interface up
+        run_cmd("ip", &["link", "set", &self.ifname, "up"])?;
+
+        // 3c. Default route through TUN
+        run_cmd(
+            "ip",
+            &["route", "add", "0.0.0.0/0", "dev", &self.ifname],
+        )?;
+
+        // 3d. Exclude the real server IP so traffic to it still goes via the
+        //     physical default gateway (prevents tunnel recursion).
+        let gateway = read_default_gateway()?;
+        run_cmd(
+            "ip",
+            &[
+                "route",
+                "add",
+                &format!("{}/32", server_ip),
+                "via",
+                &gateway,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Set the MTU of the TUN interface.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), HvpnError> {
+        run_cmd(
+            "ip",
+            &["link", "set", &self.ifname, "mtu", &mtu.to_string()],
+        )
     }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Run an external command and return an error if it exits non-zero.
+fn run_cmd(prog: &str, args: &[&str]) -> Result<(), HvpnError> {
+    let status = std::process::Command::new(prog)
+        .args(args)
+        .status()
+        .map_err(|e| HvpnError::Tun(format!("spawn `{} {}`: {}", prog, args.join(" "), e)))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(HvpnError::Tun(format!(
+            "`{} {}` exited with {}",
+            prog,
+            args.join(" "),
+            status
+        )))
+    }
+}
+
+/// Parse `/proc/net/route` and return the IPv4 gateway of the default route
+/// as a dotted-decimal string (e.g. `"192.168.1.1"`).
+///
+/// The file has space-separated fields; the default route is the line whose
+/// Destination field is `00000000`. The Gateway field is the third column,
+/// stored as a little-endian 32-bit hex value.
+fn read_default_gateway() -> Result<String, HvpnError> {
+    let content = std::fs::read_to_string("/proc/net/route")
+        .map_err(|e| HvpnError::Tun(format!("read /proc/net/route: {}", e)))?;
+
+    for line in content.lines().skip(1) {
+        // Columns: Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        if cols[1] == "00000000" {
+            // Gateway is little-endian hex; parse as u32 and convert.
+            let gw_hex = cols[2];
+            let gw_u32 = u32::from_str_radix(gw_hex, 16)
+                .map_err(|e| HvpnError::Tun(format!("parse gateway hex '{}': {}", gw_hex, e)))?;
+            // Little-endian: byte 0 = bits 0-7 of u32, etc.
+            let b0 = (gw_u32 & 0xFF) as u8;
+            let b1 = ((gw_u32 >> 8) & 0xFF) as u8;
+            let b2 = ((gw_u32 >> 16) & 0xFF) as u8;
+            let b3 = (gw_u32 >> 24) as u8;
+            return Ok(format!("{}.{}.{}.{}", b0, b1, b2, b3));
+        }
+    }
+
+    Err(HvpnError::Tun(
+        "no default route found in /proc/net/route".to_string(),
+    ))
+}
+
 /// Thin wrapper around the raw `ioctl` syscall.
-#[cfg(target_os = "linux")]
 unsafe fn libc_ioctl(fd: RawFd, request: u64, arg: u64) -> i64 {
     libc::ioctl(fd, request, arg) as i64
 }
+
+// ── TunDevice impl ────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl TunDevice for LinuxTun {
