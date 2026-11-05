@@ -321,12 +321,14 @@ HVPN/
 │   ├── hvpn-client.service     # Systemd unit for the client
 │   ├── install.sh              # Install script
 │   ├── build-deb.sh            # Debian package builder
+│   ├── build-windows.ps1       # Windows release build / staging script
 │   ├── example-server.toml     # Example server config
 │   └── example-client.toml     # Example client config
 ├── bins/
-│   ├── hvpn-client/            # Client binary
+│   ├── hvpn-client/            # Client binary (interactive + Windows service)
 │   ├── hvpn-server/            # Server binary
-│   └── hvpn-ctl/               # Control CLI
+│   ├── hvpn-ctl/               # Control CLI
+│   └── hvpn-tray/              # Windows GUI tray app
 └── crates/
     ├── hvpn-common/            # Config, error types, audit logger
     ├── hvpn-core/              # Frame codec, replay window, multiplexer
@@ -338,7 +340,7 @@ HVPN/
     ├── hvpn-relay/             # Onion relay routing
     ├── hvpn-stego/             # Steganographic transport
     ├── hvpn-transport/         # WebSocket, HTTP/2, gRPC adapters; cert pinning
-    └── hvpn-tun/               # TUN device abstraction (Linux + stub)
+    └── hvpn-tun/               # TUN device abstraction (Linux /dev/net/tun, Windows WinTun, stub)
 ```
 
 ---
@@ -360,3 +362,74 @@ HVPN/
 - Non-HTTP connections receive a decoy nginx page to avoid protocol fingerprinting.
 - Certificate pinning defeats MITM by any CA (including rogue CAs), at the cost of requiring manual fingerprint updates on certificate rotation.
 - The `ProtectSystem=strict` systemd directive makes the filesystem read-only except for `ReadWritePaths`; review and expand `ReadWritePaths` if you write logs to a custom directory.
+
+---
+
+## Windows Support
+
+Phase 5 adds first-class Windows support. All Windows-specific code lives behind `#[cfg(target_os = "windows")]` gates; the existing Linux code is unchanged and still compiles on both platforms.
+
+### WinTun driver
+
+Windows uses the [WinTun](https://wintun.net/) layer-3 kernel driver from WireGuard instead of `/dev/net/tun`. The `hvpn-tun` crate wraps it via the `wintun` Rust crate, but the driver itself is a **signed DLL you must download yourself**:
+
+1. Download `wintun.dll` from <https://wintun.net/>.
+2. Place `wintun.dll` next to `hvpn-client.exe` (and `hvpn-server.exe`) in the same directory.
+
+The binaries compile without the DLL present; it is only required at runtime.
+
+### Building on Windows
+
+```powershell
+# Build all Windows binaries in release mode
+cargo build --workspace --release
+# Binaries land in target\release\: hvpn-client.exe, hvpn-server.exe, hvpn-ctl.exe, hvpn-tray.exe
+```
+
+Or use the helper script, which builds and stages everything into `dist\hvpn-windows\`:
+
+```powershell
+powershell -File deploy\build-windows.ps1
+```
+
+The script copies `hvpn-client.exe`, `hvpn-server.exe`, `hvpn-ctl.exe`, `hvpn-tray.exe`, and `example-client.toml` into `dist\hvpn-windows\` and reminds you to drop `wintun.dll` alongside them.
+
+### Service installation
+
+`hvpn-client` can run as a Windows service that auto-starts on boot. Install and remove it with flags (run from an elevated prompt):
+
+```powershell
+.\hvpn-client.exe --install     # register the service (AutoStart, restarts on failure)
+.\hvpn-client.exe --uninstall   # stop and remove the service
+```
+
+The service launches with `--service --config "C:\Program Files\HVPN\client.toml"`. It reports StartPending → Running → Stopped status to the Service Control Manager and shuts down cleanly on a Stop control via a cancellation token. Failure-recovery actions are configured to restart the service after 5 seconds.
+
+Run interactively (no service) the same way as on Linux: `.\hvpn-client.exe --config client.toml`.
+
+### GUI tray app
+
+`hvpn-tray.exe` is a system-tray application (green = connected, yellow = connecting, red = disconnected) with a context menu: Connect, Disconnect, Status, a Transport selector (WebSocket / HTTP/2 / gRPC), and Exit. It communicates with the running daemon over the named-pipe control socket and refreshes status every 5 seconds. Tray icons are generated in code (no image files needed).
+
+### Named-pipe control socket
+
+On Windows the control socket is a named pipe at `\\.\pipe\hvpn` (on Linux it is the Unix socket `/tmp/hvpn.sock`). `hvpn-ctl` auto-detects the platform and connects to the right endpoint, so the same commands work everywhere:
+
+```powershell
+.\hvpn-ctl.exe status
+.\hvpn-ctl.exe connect --config client.toml
+.\hvpn-ctl.exe disconnect
+.\hvpn-ctl.exe switch-transport websocket
+```
+
+### Route management
+
+On Windows, interface configuration is driven by `netsh`:
+
+- IP address: `netsh interface ip set address name="<iface>" static <tun_ip> <netmask>`
+- MTU: `netsh interface ip set subinterface "<iface>" mtu=<mtu>`
+- Default route: `netsh interface ip add route 0.0.0.0/0 "<iface>" <gateway>`
+- Server exclusion (prevents tunnel recursion): `route add <server_ip> <gateway> metric 0`
+- DNS: `netsh interface ip set dns name="<iface>" static <dns> primary` (plus `add dns ... index=N` for additional servers)
+
+The default physical gateway is discovered by parsing `route print`. All of this requires Administrator privileges, since creating network adapters and changing routes is a privileged operation.

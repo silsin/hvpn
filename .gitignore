@@ -1,5 +1,7 @@
 # Rust build output
 /target/
+# Windows release staging (created by deploy/build-windows.ps1)
+/dist/
 
 # Cargo lock is kept for reproducible builds in binary crates
 # but you can uncomment the next line to ignore it for libraries
