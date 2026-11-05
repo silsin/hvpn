@@ -12,6 +12,7 @@ hvpn-common    = { path = "../../crates/hvpn-common" }
 hvpn-crypto    = { path = "../../crates/hvpn-crypto" }
 hvpn-core      = { path = "../../crates/hvpn-core" }
 hvpn-obfs      = { path = "../../crates/hvpn-obfs" }
+hvpn-tun       = { path = "../../crates/hvpn-tun" }
 tokio          = { workspace = true }
 tokio-tungstenite = { workspace = true }
 rustls         = { workspace = true }
@@ -23,3 +24,6 @@ tracing-subscriber = { workspace = true }
 futures-util   = { workspace = true }
 dashmap        = "5.5.3"
 http           = "1.1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.153"

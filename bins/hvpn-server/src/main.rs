@@ -12,6 +12,8 @@ use hvpn_core::FrameCodec;
 use hvpn_crypto::{generate_probe_token, perform_handshake_server, decrypt_packet};
 use hvpn_obfs::ObfsEngine;
 
+mod nat;
+
 /// HVPN server — accepts tunnelled connections from HVPN clients.
 #[derive(Parser, Debug)]
 #[command(name = "hvpn-server", version, about)]
@@ -22,11 +24,6 @@ struct Cli {
 }
 
 /// Realistic nginx decoy page served to unauthenticated probes.
-/// Served on the raw-TCP code path (non-HTTP traffic) via an AsyncWrite on
-/// the TcpStream before the WebSocket upgrade is attempted.  When the WS
-/// handshake itself rejects an invalid token the 403 response is emitted by
-/// tungstenite; the DECOY_PAGE body is included there as the response body
-/// where the tungstenite API permits (see `accept_hdr_async` closure).
 #[allow(dead_code)]
 const DECOY_PAGE: &[u8] = b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/html\r\n\
@@ -42,6 +39,16 @@ Connection: close\r\n\
 <p><em>Thank you for using nginx.</em></p>\n\
 </body>\n\
 </html>\r\n";
+
+/// Shared server state passed to every connection task.
+struct ServerState {
+    server_secret: [u8; 32],
+    mac_key: [u8; 32],
+    nonce_cache: Arc<DashMap<[u8; 32], u64>>,
+    /// Present only on Linux when `config.nat_enabled = true`.
+    #[cfg(target_os = "linux")]
+    nat_router: Option<Arc<nat::NatRouter>>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,11 +74,11 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding to {}", bind_addr))?;
 
-    // Server static X25519 key (zeroed in Phase 1; load from config in Phase 2).
+    // Server static X25519 key (zeroed in Phase 1; loaded from config in Phase 2).
     let server_secret_bytes = [0u8; 32];
-    // Derive a stable mac_key from the server secret for probe token verification.
+
+    // Derive a stable mac_key from the server secret for probe-token verification.
     let mac_key: [u8; 32] = {
-        // Use a known dummy ephemeral key to derive mac_key.
         let dummy_ephemeral = [0xFFu8; 32];
         match perform_handshake_server(&dummy_ephemeral, &server_secret_bytes) {
             Ok(k) => k.mac_key,
@@ -79,14 +86,29 @@ async fn main() -> Result<()> {
         }
     };
 
+    // ── NAT routing setup (Linux only) ────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    let nat_router: Option<Arc<nat::NatRouter>> = if cfg.nat_enabled {
+        nat::setup_nat("10.8.0.1")
+            .with_context(|| "NAT setup failed")?;
+        info!("NAT routing enabled");
+        Some(Arc::new(nat::NatRouter::new()))
+    } else {
+        None
+    };
+
     // Nonce / replay cache: maps 32-byte token → UNIX timestamp of first use.
     let nonce_cache: Arc<DashMap<[u8; 32], u64>> = Arc::new(DashMap::new());
 
+    let state = Arc::new(ServerState {
+        server_secret: server_secret_bytes,
+        mac_key,
+        nonce_cache,
+        #[cfg(target_os = "linux")]
+        nat_router,
+    });
+
     // ── Port-knock listener ────────────────────────────────────────────────
-    // Listens on (server_port - 1) UDP.  A client sends a valid probe token
-    // (hex-encoded 32 bytes) to whitelist its IP for 10 seconds.
-    // Enforcement is gated on the HVPN_REQUIRE_KNOCK env-var so that tests
-    // (which don't set it) keep connecting without a knock.
     let knock_whitelist: Arc<DashMap<std::net::IpAddr, std::time::Instant>> =
         Arc::new(DashMap::new());
 
@@ -140,7 +162,6 @@ async fn main() -> Result<()> {
 
         // ── Port-knock enforcement ─────────────────────────────────────────
         if require_knock {
-            // Evict stale whitelist entries (> 10 seconds old).
             knock_whitelist.retain(|_, ts| ts.elapsed().as_secs() < 10);
             if !knock_whitelist.contains_key(&peer_addr.ip()) {
                 warn!(%peer_addr, "port-knock required — closing connection");
@@ -149,20 +170,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        let mac_key_clone = mac_key;
-        let server_secret = server_secret_bytes;
-        let nonce_cache_clone = nonce_cache.clone();
+        let state_clone = state.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                stream,
-                peer_addr.to_string(),
-                mac_key_clone,
-                server_secret,
-                nonce_cache_clone,
-            )
-            .await
-            {
+            if let Err(e) = handle_connection(stream, peer_addr, state_clone).await {
                 warn!(%peer_addr, error = %e, "connection error");
             }
         });
@@ -171,44 +182,34 @@ async fn main() -> Result<()> {
 
 async fn handle_connection(
     stream: tokio::net::TcpStream,
-    peer: String,
-    mac_key: [u8; 32],
-    server_secret: [u8; 32],
-    nonce_cache: Arc<DashMap<[u8; 32], u64>>,
+    peer_addr: std::net::SocketAddr,
+    state: Arc<ServerState>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    // Peek at the first 4 bytes to decide if this looks like an HTTP GET.
-    // If it is not an HTTP upgrade we serve the nginx decoy page directly and
-    // return — the stream is still unmodified at this point.
+    let peer = peer_addr.to_string();
+
+    // Peek at the first 4 bytes: if not "GET " serve the nginx decoy and close.
     let mut peek_buf = [0u8; 4];
     let n = stream.peek(&mut peek_buf).await?;
-
     if n < 4 || &peek_buf[..4] != b"GET " {
-        // Not an HTTP upgrade — serve the nginx decoy page on the raw stream.
         let mut owned = stream;
         let _ = owned.write_all(DECOY_PAGE).await;
         warn!(%peer, "non-HTTP probe — served decoy page");
         return Ok(());
     }
 
-    // ── WebSocket handshake ────────────────────────────────────────────────
-    // We do a lightweight signature + timestamp check synchronously inside the
-    // callback (sync closure — no async allowed).  The full replay-cache check
-    // (which needs async-safe DashMap mutation) runs after the WS accept below.
-
-    // Use an atomic cell to carry the validated token bytes out of the closure
-    // so we can do the replay check in async context afterward.
+    // ── WebSocket handshake with sync auth check ───────────────────────────
     let validated_token: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
         Arc::new(std::sync::Mutex::new(None));
     let vt_clone = validated_token.clone();
+    let mac_key = state.mac_key;
 
     #[allow(clippy::result_large_err)]
     let ws_stream_result = tokio_tungstenite::accept_hdr_async(
         stream,
         move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
               mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            // ── Sync token check (signature + timestamp) ───────────────
             let token_valid = req
                 .headers()
                 .get("x-auth-token")
@@ -216,17 +217,13 @@ async fn handle_connection(
                 .map(|hex| {
                     let bytes = hex_decode(hex);
                     if bytes.len() == 32 {
-                        // Validate timestamp embedded in first 8 bytes.
                         let mut ts_bytes = [0u8; 8];
                         ts_bytes.copy_from_slice(&bytes[..8]);
                         let token_ts = u64::from_le_bytes(ts_bytes);
                         let now = current_timestamp_secs();
-                        let diff = now.abs_diff(token_ts);
-                        if diff > 30 {
+                        if now.abs_diff(token_ts) > 30 {
                             return false;
                         }
-
-                        // Verify HMAC signature against current time window.
                         let nonce = [0u8; 16];
                         for delta in 0u64..3 {
                             let expected = generate_probe_token(
@@ -235,7 +232,6 @@ async fn handle_connection(
                                 &nonce,
                             );
                             if bytes.as_slice() == expected.as_slice() {
-                                // Stash the raw bytes for the async replay check.
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&bytes);
                                 if let Ok(mut guard) = vt_clone.lock() {
@@ -259,45 +255,40 @@ async fn handle_connection(
 
     match ws_stream_result {
         Ok(ws_stream) => {
-            // ── Async replay-cache check ───────────────────────────────
+            // Async replay-cache check.
             let token_arr = {
                 let guard = validated_token.lock().unwrap();
                 *guard
             };
-
             if let Some(token_arr) = token_arr {
                 let now = current_timestamp_secs();
-
-                // Evict entries older than 60 seconds.
-                nonce_cache.retain(|_, &mut stored_ts| now.saturating_sub(stored_ts) <= 60);
-
-                // Replay detection.
-                if nonce_cache.contains_key(&token_arr) {
+                state
+                    .nonce_cache
+                    .retain(|_, &mut stored_ts| now.saturating_sub(stored_ts) <= 60);
+                if state.nonce_cache.contains_key(&token_arr) {
                     warn!(%peer, "replay token detected — closing connection");
-                    // Close the WS stream gracefully.
                     let (mut sink, _) = ws_stream.split();
                     let _ = sink.close().await;
                     return Ok(());
                 }
-
-                // Register token in the cache.
-                nonce_cache.insert(token_arr, now);
+                state.nonce_cache.insert(token_arr, now);
             }
 
-            handle_authenticated(ws_stream, peer, server_secret).await
+            handle_authenticated(ws_stream, peer, peer_addr, state).await
         }
         Err(e) => {
-            // WS handshake rejected (403 already sent by tungstenite).
             warn!(%peer, "rejected connection: {}", e);
             Ok(())
         }
     }
 }
 
+#[allow(unused_variables)]
 async fn handle_authenticated(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     peer: String,
-    server_secret: [u8; 32],
+    peer_addr: std::net::SocketAddr,
+    state: Arc<ServerState>,
 ) -> Result<()> {
     use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -305,12 +296,12 @@ async fn handle_authenticated(
 
     let (mut sink, mut source) = ws_stream.split();
 
-    // Expect the first message to be the client's ephemeral public key (32 bytes).
+    // First message: client's ephemeral X25519 public key (32 bytes).
     let session_keys = match source.next().await {
         Some(Ok(Message::Binary(data))) if data.len() >= 32 => {
             let mut ephemeral = [0u8; 32];
             ephemeral.copy_from_slice(&data[..32]);
-            perform_handshake_server(&ephemeral, &server_secret)
+            perform_handshake_server(&ephemeral, &state.server_secret)
                 .map_err(|e| anyhow::anyhow!("handshake error: {}", e))?
         }
         other => {
@@ -321,27 +312,149 @@ async fn handle_authenticated(
 
     info!(%peer, "crypto handshake complete");
 
-    let codec = FrameCodec::new(session_keys.header_key);
-    let mut replay = hvpn_core::ReplayWindow::new();
-    let obfs = ObfsEngine::new();
+    // Save the header key so we can build fresh FrameCodec instances per task.
+    let header_key = session_keys.header_key;
 
-    // Receive-and-log loop (Phase 1 — no NAT/routing yet).
+    // ── NAT routing path (Linux only) ─────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    if let Some(router) = state.nat_router.as_ref().map(Arc::clone) {
+        use hvpn_core::Frame;
+        use hvpn_core::FrameType;
+        use hvpn_tun::LinuxTun;
+        use hvpn_tun::TunDevice;
+
+        // Assign this client a VPN IP.
+        let _client_ip = router.assign_client_ip(peer_addr);
+
+        // Open two independent TUN file descriptors: one for each direction.
+        let tun_read = LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await;
+        let tun_write = LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await;
+
+        match (tun_read, tun_write) {
+            (Ok(mut tun_r), Ok(mut tun_w)) => {
+                let keys_a = session_keys.clone(); // for TUN→client
+                let keys_b = session_keys.clone(); // for client→TUN
+                let peer_a = peer.clone();
+                let peer_b = peer.clone();
+                let router_b = router.clone();
+                let client_addr = peer_addr;
+
+                // Task A: server TUN → client WS (read plaintext, encrypt, send)
+                let tun_to_client = tokio::spawn(async move {
+                    // Per-task codec and obfs engine built from copied keys.
+                    let codec_a = FrameCodec::new(keys_a.header_key);
+                    let mut obfs_a = ObfsEngine::new();
+                    // Outbound sequence counter for TUN→client direction.
+                    let mut out_seq: u64 = 0;
+                    loop {
+                        match tun_r.read_packet().await {
+                            Ok(ip_pkt) => {
+                                match hvpn_crypto::encrypt_packet(&keys_a, &ip_pkt, out_seq, None) {
+                                    Ok(ciphertext) => {
+                                        let frame = Frame {
+                                            seq: out_seq,
+                                            stream_id: 0,
+                                            frame_type: FrameType::Data,
+                                            flags: 0,
+                                            payload: ciphertext,
+                                            padding: vec![],
+                                        };
+                                        let encoded = codec_a.encode(&frame);
+                                        let padded = obfs_a.pad_packet(encoded);
+                                        if sink.send(Message::Binary(padded)).await.is_err() {
+                                            break;
+                                        }
+                                        out_seq = out_seq.wrapping_add(1);
+                                    }
+                                    Err(e) => warn!(peer = %peer_a, "encrypt error: {}", e),
+                                }
+                            }
+                            Err(e) => {
+                                warn!(peer = %peer_a, "TUN read error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                // Task B: client WS → server TUN (receive, decrypt, write)
+                let client_to_tun = tokio::spawn(async move {
+                    let codec_b = FrameCodec::new(keys_b.header_key);
+                    let obfs_b = ObfsEngine::new();
+                    let mut replay = hvpn_core::ReplayWindow::new();
+                    while let Some(msg) = source.next().await {
+                        match msg {
+                            Ok(Message::Binary(data)) => {
+                                let unpadded = obfs_b.unpad_packet(data);
+                                match codec_b.decode(&unpadded) {
+                                    Ok(frame) => {
+                                        if let Err(e) = replay.check_and_advance(frame.seq) {
+                                            warn!(peer = %peer_b, "replay: {}", e);
+                                            continue;
+                                        }
+                                        match hvpn_crypto::decrypt_packet(
+                                            &keys_b,
+                                            &frame.payload,
+                                            frame.seq,
+                                            None,
+                                        ) {
+                                            Ok(ip_pkt) => {
+                                                if let Err(e) = tun_w.write_packet(&ip_pkt).await {
+                                                    warn!(peer = %peer_b, "TUN write: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => warn!(peer = %peer_b, "decrypt: {}", e),
+                                        }
+                                    }
+                                    Err(e) => warn!(peer = %peer_b, "frame decode: {}", e),
+                                }
+                            }
+                            Ok(Message::Close(_)) => {
+                                info!(peer = %peer_b, "client closed NAT connection");
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(peer = %peer_b, "ws error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    router_b.release_client_ip(&client_addr);
+                });
+
+                tokio::select! {
+                    _ = tun_to_client => {}
+                    _ = client_to_tun => {}
+                }
+                info!(%peer, "NAT connection closed");
+                return Ok(());
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                warn!(%peer,
+                    "could not open TUN for NAT forwarding: {} — falling back to log loop",
+                    e
+                );
+            }
+        }
+    }
+
+    // ── Phase-1 log-only loop (NAT disabled or TUN unavailable) ───────────
+    let codec = FrameCodec::new(header_key);
+    let obfs = ObfsEngine::new();
+    let mut replay = hvpn_core::ReplayWindow::new();
+
     while let Some(msg) = source.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                // Unpad.
                 let unpadded = obfs.unpad_packet(data);
-
-                // Decode frame.
                 match codec.decode(&unpadded) {
                     Ok(frame) => {
-                        // Replay check.
                         if let Err(e) = replay.check_and_advance(frame.seq) {
                             warn!(%peer, "replay: {}", e);
                             continue;
                         }
-
-                        // Decrypt payload.
                         match decrypt_packet(&session_keys, &frame.payload, frame.seq, None) {
                             Ok(plaintext) => {
                                 info!(
@@ -349,9 +462,8 @@ async fn handle_authenticated(
                                     seq  = frame.seq,
                                     sid  = frame.stream_id,
                                     len  = plaintext.len(),
-                                    "received IP packet (Phase 1: logging only)"
+                                    "received IP packet (NAT disabled: logging only)"
                                 );
-                                // Phase 2: route through NAT / IP stack.
                             }
                             Err(e) => warn!(%peer, "decrypt failed: {}", e),
                         }
