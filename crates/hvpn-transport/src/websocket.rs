@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use hvpn_common::HvpnError;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{
@@ -13,9 +14,99 @@ use tokio_tungstenite::{
     Connector,
 };
 use futures_util::{SinkExt, StreamExt};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
 use crate::transport_trait::Transport;
 use crate::DomainFrontConfig;
+use crate::CertPin;
+
+// ── Certificate pinning verifier ──────────────────────────────────────────────
+
+/// A custom `ServerCertVerifier` that enforces SHA-256 certificate fingerprint
+/// pinning when fingerprints are provided, and falls back to standard WebPKI
+/// verification when the pin list is empty.
+#[derive(Debug)]
+pub struct CertVerifier {
+    cert_pin: CertPin,
+    /// Delegate verifier used for standard WebPKI and signature verification.
+    webpki: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl CertVerifier {
+    pub fn new(cert_pin: CertPin, root_store: rustls::RootCertStore) -> Self {
+        let webpki = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .expect("failed to build WebPkiServerVerifier");
+        Self { cert_pin, webpki }
+    }
+}
+
+impl ServerCertVerifier for CertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        // Compute SHA-256 of the DER-encoded end-entity certificate.
+        let mut hasher = Sha256::new();
+        hasher.update(end_entity.as_ref());
+        let fingerprint: [u8; 32] = hasher.finalize().into();
+
+        if self.cert_pin.sha256_fingerprints.is_empty() {
+            // No pins configured: fall back to full WebPKI verification.
+            self.webpki.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            )
+        } else {
+            // Pin mode: check fingerprint against the allow-list.
+            let matched = self
+                .cert_pin
+                .sha256_fingerprints
+                .iter()
+                .any(|pin| pin == &fingerprint);
+            if matched {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(TlsError::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ))
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.webpki.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.webpki.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.webpki.supported_verify_schemes()
+    }
+}
+
+// ── TransportConfig ───────────────────────────────────────────────────────────
 
 /// Configuration for establishing a WebSocket transport connection.
 #[derive(Debug, Clone)]
@@ -29,6 +120,9 @@ pub struct TransportConfig {
     /// Optional PEM certificate bytes for TLS certificate pinning.
     /// When `None`, the system/webpki root store is used.
     pub tls_cert_override: Option<Vec<u8>>,
+    /// Optional certificate fingerprint pin. When `Some`, the `CertVerifier`
+    /// is installed as a custom verifier.
+    pub cert_pin: Option<CertPin>,
 }
 
 impl TransportConfig {
@@ -38,9 +132,12 @@ impl TransportConfig {
             port,
             path: path.into(),
             tls_cert_override: None,
+            cert_pin: None,
         }
     }
 }
+
+// ── WebSocketTransport ────────────────────────────────────────────────────────
 
 type WsStream = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -89,12 +186,25 @@ impl WebSocketTransport {
                 .unwrap(),
         );
 
-        // Build the rustls TLS connector backed by webpki root certificates.
+        // Build the rustls TLS connector.
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+
+        let tls_config = if let Some(ref pin) = cfg.cert_pin {
+            // Install a custom cert verifier that enforces fingerprint pinning.
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(CertVerifier::new(
+                    pin.clone(),
+                    root_store,
+                )))
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
         let connector = Connector::Rustls(Arc::new(tls_config));
 
         let (ws_stream, _response) =
@@ -206,6 +316,8 @@ impl Transport for WebSocketTransport {
     }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +329,7 @@ mod tests {
         assert_eq!(cfg.port, 443);
         assert_eq!(cfg.path, "/ws");
         assert!(cfg.tls_cert_override.is_none());
+        assert!(cfg.cert_pin.is_none());
     }
 
     #[test]
@@ -224,5 +337,62 @@ mod tests {
         let mut cfg = TransportConfig::new("vpn.example.com", 443, "/ws");
         cfg.tls_cert_override = Some(b"--- BEGIN CERTIFICATE ---".to_vec());
         assert!(cfg.tls_cert_override.is_some());
+    }
+
+    /// Install the ring crypto provider (needed by WebPkiServerVerifier in rustls 0.23).
+    /// Safe to call multiple times — subsequent calls are no-ops.
+    fn install_ring() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn test_cert_pin_rejects_wrong_cert() {
+        install_ring();
+
+        // Build a CertPin with a dummy fingerprint (all 0xAA bytes).
+        let pin = CertPin {
+            sha256_fingerprints: vec![[0xAAu8; 32]],
+        };
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let verifier = CertVerifier::new(pin, root_store);
+
+        // Construct a fake DER cert (random bytes — not a real cert).
+        // The SHA-256 of these bytes will not be [0xAA; 32].
+        let fake_cert = CertificateDer::from(vec![0x01u8; 64]);
+        let server_name = ServerName::try_from("example.com").unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(0));
+
+        let result = verifier.verify_server_cert(&fake_cert, &[], &server_name, &[], now);
+        assert!(result.is_err(), "wrong fingerprint should be rejected");
+    }
+
+    #[test]
+    fn test_cert_pin_empty_falls_back_to_webpki() {
+        install_ring();
+
+        // Empty fingerprint list — verifier should not do pin checking.
+        // A fake cert will fail WebPKI (which is expected), but must NOT
+        // fail with an UnknownIssuer fingerprint mismatch error.
+        let pin = CertPin {
+            sha256_fingerprints: vec![],
+        };
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let verifier = CertVerifier::new(pin, root_store);
+
+        let fake_cert = CertificateDer::from(vec![0x01u8; 64]);
+        let server_name = ServerName::try_from("example.com").unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(0));
+
+        let result = verifier.verify_server_cert(&fake_cert, &[], &server_name, &[], now);
+        // Expected: error from WebPKI (not a valid cert), but it reached WebPKI
+        // rather than being rejected by pin matching.
+        assert!(result.is_err());
+        // Must NOT be UnknownIssuer (which would indicate pin rejection, not WebPKI fallback).
+        if let Err(TlsError::InvalidCertificate(rustls::CertificateError::UnknownIssuer)) = result
+        {
+            panic!("empty pin list should fall back to WebPKI, not reject by pin");
+        }
     }
 }

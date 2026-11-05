@@ -1,0 +1,14 @@
+server_address = "0.0.0.0"
+server_port = 443
+tun_ip = "10.8.0.1"
+tun_netmask = "255.255.255.0"
+nat_enabled = true
+post_quantum = false
+stego_mode = false
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+cert_pin_fingerprints = []
+tls_cert_path = "/etc/hvpn/server.crt"
+
+[tls]
+cert_path = "/etc/hvpn/server.crt"
+key_path = "/etc/hvpn/server.key"

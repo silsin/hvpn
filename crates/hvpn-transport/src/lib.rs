@@ -3,14 +3,23 @@ mod websocket;
 mod http2;
 mod grpc;
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
 pub use transport_trait::Transport;
-pub use websocket::{TransportConfig, WebSocketTransport};
+pub use websocket::{CertVerifier, TransportConfig, WebSocketTransport};
 pub use http2::Http2Transport;
 pub use grpc::GrpcTransport;
 pub use hvpn_crypto::{build_tls_config_raw, TlsProfile, TlsProfileConfig};
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+/// SHA-256 certificate fingerprint pin. When `sha256_fingerprints` is non-empty,
+/// the TLS connection will be rejected unless the server's end-entity certificate
+/// matches one of the listed fingerprints.
+#[derive(Debug, Clone)]
+pub struct CertPin {
+    /// SHA-256 hash of the DER-encoded end-entity certificate.
+    pub sha256_fingerprints: Vec<[u8; 32]>,
+}
 
 /// Domain fronting configuration: TLS SNI differs from the HTTP Host header.
 #[derive(Debug, Clone)]

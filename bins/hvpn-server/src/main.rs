@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use hvpn_common::Config;
+use hvpn_common::{AuditEvent, AuditLogger, Config};
 use hvpn_core::FrameCodec;
 use hvpn_crypto::{generate_probe_token, perform_handshake_server, decrypt_packet};
 use hvpn_obfs::ObfsEngine;
@@ -61,11 +61,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let raw = tokio::fs::read_to_string(&cli.config)
-        .await
-        .with_context(|| format!("reading config file {:?}", cli.config))?;
-    let cfg = Config::from_toml_str(&raw)
-        .with_context(|| "parsing config file")?;
+    let cfg = Config::load_and_validate(cli.config.to_str().unwrap_or("config.toml"))
+        .unwrap_or_else(|e| {
+            eprintln!("[hvpn-server] configuration error:\n{}", e);
+            std::process::exit(1);
+        });
 
     let bind_addr = format!("0.0.0.0:{}", cfg.server_port);
     info!(addr = %bind_addr, "HVPN server listening");
@@ -108,6 +108,10 @@ async fn main() -> Result<()> {
         nat_router,
     });
 
+    // ── Audit logger ──────────────────────────────────────────────────────
+    let audit_log_path = std::env::var("HVPN_AUDIT_LOG").ok();
+    let audit = Arc::new(AuditLogger::new(audit_log_path.as_deref()));
+
     // ── Port-knock listener ────────────────────────────────────────────────
     let knock_whitelist: Arc<DashMap<std::net::IpAddr, std::time::Instant>> =
         Arc::new(DashMap::new());
@@ -120,6 +124,7 @@ async fn main() -> Result<()> {
                 let knock_socket = Arc::new(sock);
                 let whitelist = knock_whitelist.clone();
                 let mac_key_for_knock = mac_key;
+                let audit_knock = audit.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 256];
                     loop {
@@ -141,6 +146,10 @@ async fn main() -> Result<()> {
                                 if valid {
                                     whitelist.insert(src.ip(), std::time::Instant::now());
                                     info!(ip = %src.ip(), "port-knock accepted");
+                                    audit_knock.log(AuditEvent::KnockAccepted {
+                                        peer_ip: src.ip().to_string(),
+                                        timestamp: AuditLogger::current_timestamp(),
+                                    });
                                 }
                             }
                         }
@@ -171,9 +180,15 @@ async fn main() -> Result<()> {
         }
 
         let state_clone = state.clone();
+        let audit_clone = audit.clone();
+
+        audit_clone.log(AuditEvent::ClientConnected {
+            peer_ip: peer_addr.ip().to_string(),
+            timestamp: AuditLogger::current_timestamp(),
+        });
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, state_clone).await {
+            if let Err(e) = handle_connection(stream, peer_addr, state_clone, audit_clone).await {
                 warn!(%peer_addr, error = %e, "connection error");
             }
         });
@@ -184,6 +199,7 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
     state: Arc<ServerState>,
+    audit: Arc<AuditLogger>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -196,6 +212,10 @@ async fn handle_connection(
         let mut owned = stream;
         let _ = owned.write_all(DECOY_PAGE).await;
         warn!(%peer, "non-HTTP probe — served decoy page");
+        audit.log(AuditEvent::ProbeRejected {
+            peer_ip: peer_addr.ip().to_string(),
+            timestamp: AuditLogger::current_timestamp(),
+        });
         return Ok(());
     }
 
@@ -274,10 +294,15 @@ async fn handle_connection(
                 state.nonce_cache.insert(token_arr, now);
             }
 
-            handle_authenticated(ws_stream, peer, peer_addr, state).await
+            handle_authenticated(ws_stream, peer, peer_addr, state, audit).await
         }
         Err(e) => {
             warn!(%peer, "rejected connection: {}", e);
+            audit.log(AuditEvent::HandshakeFailed {
+                peer_ip: peer_addr.ip().to_string(),
+                reason: e.to_string(),
+                timestamp: AuditLogger::current_timestamp(),
+            });
             Ok(())
         }
     }
@@ -289,6 +314,7 @@ async fn handle_authenticated(
     peer: String,
     peer_addr: std::net::SocketAddr,
     state: Arc<ServerState>,
+    audit: Arc<AuditLogger>,
 ) -> Result<()> {
     use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -429,6 +455,11 @@ async fn handle_authenticated(
                     _ = client_to_tun => {}
                 }
                 info!(%peer, "NAT connection closed");
+                audit.log(AuditEvent::ClientDisconnected {
+                    peer_ip: peer_addr.ip().to_string(),
+                    reason: "clean close".to_string(),
+                    timestamp: AuditLogger::current_timestamp(),
+                });
                 return Ok(());
             }
             (Err(e), _) | (_, Err(e)) => {
@@ -485,6 +516,11 @@ async fn handle_authenticated(
 
     let _ = sink.close().await;
     info!(%peer, "connection closed");
+    audit.log(AuditEvent::ClientDisconnected {
+        peer_ip: peer_addr.ip().to_string(),
+        reason: "clean close".to_string(),
+        timestamp: AuditLogger::current_timestamp(),
+    });
     Ok(())
 }
 

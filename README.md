@@ -1,155 +1,293 @@
 # HVPN
 
-A Rust-based VPN with obfuscated WebSocket transport, X25519 key exchange, ChaCha20-Poly1305 encryption, and a port-knock listener for stealth deployments.
+A Rust-based, DPI-evasion VPN protocol designed to bypass deep packet inspection and network filtering using adaptive transport camouflage, onion routing, and post-quantum hybrid cryptography.
+
+---
+
+## Feature Overview
+
+### Phase 1 — Core Tunnel
+- **ChaCha20-Poly1305** authenticated encryption for all tunnel traffic
+- **X25519** ephemeral key exchange (ECDH handshake)
+- **WebSocket transport** with realistic browser HTTP headers to blend in with HTTPS traffic
+- **TUN interface** abstraction (Linux `/dev/net/tun`; cross-platform `StubTun` for development)
+- **Replay protection** via sliding-window sequence number cache
+- **Probe-token authentication** — HMAC-based time-bounded tokens checked before WebSocket upgrade
+- **Port-knocking** — UDP knock port; whitelist entry valid for 10 seconds
+- **Obfuscation engine** — packet padding and inter-packet jitter
+- **Frame codec** — length-prefixed binary framing with header encryption
+
+### Phase 2 — Advanced Evasion
+- **HTTP/2 and gRPC transports** — additional camouflage layers over plain TCP
+- **Domain fronting** — TLS SNI differs from the HTTP Host header; routes through CDN
+- **Adaptive transport switching** — probes all transports, picks the fastest; auto-switches on packet-loss or high RTT
+- **Steganographic mode** — tunnels data inside carrier traffic patterns
+- **Relay / onion routing** — multi-hop encrypted relay chain (configurable up to N hops)
+- **Metrics collection** — RTT and packet-loss tracking via `hvpn-metrics`
+- **Post-quantum hybrid KEM** — CRYSTALS-Kyber KEM combined with X25519 (harvest-now-decrypt-later protection)
+
+### Phase 3 — Production Features
+- **`hvpn-ctl`** — CLI control plane: status, connect, disconnect, switch-transport, relay management
+- **NAT routing** — server-side IP masquerading for full internet access through the tunnel
+- **TLS ratcheting** — periodic re-keying to limit the blast radius of any single session key
+- **Protocol Buffers** — gRPC frame definitions via `hvpn-proto`
+
+### Phase 4 — Production Hardening
+- **Certificate pinning** — SHA-256 fingerprint pinning (`cert_pin_fingerprints`) to defeat MITM attacks
+- **Full config validation** — `Config::load_and_validate` collects all errors before startup
+- **Structured audit trail** — JSON-lines audit log (`HVPN_AUDIT_LOG` env var) with event types: `client_connected`, `client_disconnected`, `handshake_failed`, `probe_rejected`, `knock_accepted`, `transport_switched`, `ratchet_rotated`, `nat_assigned`
+- **Systemd service units** — `deploy/hvpn-server.service`, `deploy/hvpn-client.service`
+- **Debian packaging** — `deploy/build-deb.sh` produces a `.deb` installable package
 
 ---
 
 ## Architecture
 
 ```
-hvpn-client  ←──WebSocket/TLS──→  hvpn-server
-     │                                  │
- hvpn-tun (TUN device)           (routes IP traffic)
-     │
- hvpn-crypto  (X25519 handshake, ChaCha20-Poly1305)
- hvpn-core    (frame codec, replay window, mux)
- hvpn-obfs    (traffic shaping / padding)
- hvpn-transport (WebSocket, HTTP/2, gRPC adapters)
- hvpn-metrics  (RTT, packet-loss tracking)
+Client TUN → ObfsEngine → FrameCodec → Crypto (ChaCha20/X25519/PQ) → Transport (WS/H2/gRPC)
+  → [Optional: Relay chain (onion)] → Server Transport → Crypto decrypt → NAT → Internet
 ```
 
-The client reads IP packets from a TUN device, encrypts and frames them, applies obfuscation padding, and sends them over a mutually-authenticated WebSocket connection. The server decrypts and (Phase 2) routes the packets through a NAT/IP stack.
+### Crate Dependencies
+
+```
+bins/hvpn-client ─────────────────────────────────────────────────────┐
+bins/hvpn-server ─────────────────────────────────────────────────────┤
+bins/hvpn-ctl ────────────────────────────────────────────────────────┤
+                                                                        │
+crates/hvpn-transport ──► hvpn-common, hvpn-crypto, hvpn-metrics      │
+crates/hvpn-core ────────► hvpn-common                                 │
+crates/hvpn-crypto ──────► hvpn-common                                 │
+crates/hvpn-obfs ────────► hvpn-common                                 │
+crates/hvpn-tun ─────────► hvpn-common                                 │
+crates/hvpn-relay ───────► hvpn-common, hvpn-crypto                   │
+crates/hvpn-stego ───────► hvpn-common                                 │
+crates/hvpn-pq ──────────► hvpn-common, hvpn-crypto                   │
+crates/hvpn-proto ───────► (protobuf generated)                        │
+crates/hvpn-metrics ─────► (standalone)                                │
+crates/hvpn-common ──────► (base: config, error, audit)                │
+```
 
 ---
 
-## Prerequisites
+## Quick Start
+
+### 1. Prerequisites
 
 | Tool | Minimum version | Notes |
 |------|-----------------|-------|
 | Rust + Cargo | 1.75 | Install via [rustup](https://rustup.rs/) |
-| OpenSSL / system TLS | any | Needed to build `rustls` ring backend |
-| Linux (server) | kernel 5.x+ | `/dev/net/tun` is required for the real TUN driver. The client falls back to `StubTun` on other platforms. |
+| Linux (server) | kernel 5.x+ | `/dev/net/tun` required for real TUN; `StubTun` used elsewhere |
+
+### 2. Build
+
+```bash
+git clone https://github.com/example/hvpn
+cd hvpn
+cargo build --workspace --release
+# Binaries: target/release/hvpn-server, hvpn-client, hvpn-ctl
+```
+
+### 3. Generate Keys
+
+```bash
+# Generate a 32-byte server static key (hex-encoded):
+openssl rand -hex 32
+```
+
+### 4. Configure the Server
+
+```bash
+cp deploy/example-server.toml /etc/hvpn/server.toml
+# Edit /etc/hvpn/server.toml
+```
+
+### 5. Run the Server
+
+```bash
+RUST_LOG=info ./target/release/hvpn-server --config /etc/hvpn/server.toml
+```
+
+### 6. Configure and Run the Client
+
+```bash
+cp deploy/example-client.toml /etc/hvpn/client.toml
+# Edit /etc/hvpn/client.toml — set server_address
+RUST_LOG=info ./target/release/hvpn-client --config /etc/hvpn/client.toml
+```
 
 ---
 
-## Building
+## Configuration Reference
 
-```bash
-# Build everything (all crates + both binaries)
-cargo build --release
+Both `hvpn-server` and `hvpn-client` read a single TOML config file (default: `config.toml`; override with `--config <path>`).
 
-# Binaries are written to:
-#   target/release/hvpn-server
-#   target/release/hvpn-client
-```
-
-To build only one binary:
-
-```bash
-cargo build --release -p hvpn-server
-cargo build --release -p hvpn-client
-```
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `server_address` | string | — | Server hostname or IP. Clients connect here; server binds `0.0.0.0`. |
+| `server_port` | integer | — | TCP port for tunnel connections (1–65535). |
+| `tls_cert_path` | string | — | Path to server TLS certificate (PEM). |
+| `obfs_profile` | enum | `"browser"` | Traffic-shaping profile: `browser`, `streaming`, `voip`, `idle`. |
+| `relay_chain` | array | `null` | List of relay hops (`address`, `pubkey_hex`). `null` = direct connection. |
+| `stego_mode` | bool | `false` | Enable steganographic transport mode. |
+| `post_quantum` | bool | `false` | Enable post-quantum hybrid KEM (CRYSTALS-Kyber + X25519). |
+| `nat_enabled` | bool | `false` | Enable server-side NAT routing (Linux only). |
+| `tun_ip` | string | `"10.8.0.2"` | IP address for the TUN interface. |
+| `tun_netmask` | string | `"255.255.255.0"` | Netmask for the TUN interface. |
+| `dns_servers` | array | `[]` | DNS servers to use over the tunnel. |
+| `cert_pin_fingerprints` | array | `[]` | SHA-256 cert fingerprints (hex, 64 chars each). Non-empty enables pinning. |
 
 ---
 
-## Configuration
+## Security Model
 
-Both binaries read a single TOML config file (default path: `config.toml` in the working directory, overridden with `--config <path>`).
+| Layer | Protection |
+|---|---|
+| **Transport obfuscation** | Browser-like WebSocket headers defeat passive DPI signature matching. Adaptive switching evades active probing. |
+| **Certificate pinning** | SHA-256 fingerprint pinning defeats MITM attacks by intermediate certificate authorities. |
+| **Post-quantum KEM** | Kyber-1024 + X25519 hybrid protects against harvest-now-decrypt-later attacks by well-resourced adversaries. |
+| **Replay protection** | Sliding-window sequence number cache prevents replaying captured packets. |
+| **Probe-token auth** | HMAC-based, time-bounded token must be presented in the WebSocket upgrade request; tokens expire after 30 seconds. |
+| **Port-knocking** | Optional (`HVPN_REQUIRE_KNOCK=1`): server ignores TCP connections until a valid UDP knock is received. Whitelist entry expires after 10 seconds. |
+| **Decoy response** | Non-authenticated TCP connections receive a realistic nginx HTML page instead of a protocol error, reducing server fingerprinting. |
+| **Audit trail** | Structured JSON-lines audit log records all security-relevant events for post-incident analysis. |
 
-### Minimal `config.toml`
+---
+
+## Relay Chain Usage
+
+Enable multi-hop onion routing by adding a `relay_chain` section to your config:
 
 ```toml
-server_address = "vpn.example.com"   # hostname or IP of the server
-server_port    = 443                  # TCP port the server listens on
-tls_cert_path  = "/etc/hvpn/server.pem"  # PEM certificate for TLS verification
+server_address = "exit-node.example.com"
+server_port = 443
+tls_cert_path = "/etc/hvpn/cert.pem"
 
-# Optional — traffic-shaping profile.
-# Values: "browser" (default), "streaming", "voip", "idle"
-obfs_profile = "browser"
+[[relay_chain]]
+address = "relay1.example.com:7001"
+pubkey_hex = "aabbcc...64hexchars..."
+
+[[relay_chain]]
+address = "relay2.example.com:7002"
+pubkey_hex = "ddeeff...64hexchars..."
 ```
 
-> **server_address** is only meaningful on the client. The server always binds to `0.0.0.0:<server_port>`.
+Each hop's `pubkey_hex` is the 64-character hex-encoded X25519 public key of that relay node. Traffic is encrypted in layers; each relay unwraps only its own layer.
 
 ---
 
-## Running the Server
+## Steganographic Mode
 
-### 1. Create a config file
+Enable steganographic transport by setting `stego_mode = true` in your config. In this mode the `hvpn-stego` crate encodes tunnel frames inside carrier traffic that resembles legitimate application data, making the VPN traffic invisible to statistical analysis.
 
-```bash
-cat > /etc/hvpn/server.toml << 'EOF'
-server_address = "0.0.0.0"
-server_port    = 443
-tls_cert_path  = "/etc/hvpn/server.pem"
-obfs_profile   = "browser"
-EOF
+```toml
+stego_mode = true
 ```
 
-### 2. Start the server
+No other changes are required; the transport layer automatically selects the steganographic carrier.
 
-```bash
-./target/release/hvpn-server --config /etc/hvpn/server.toml
+---
+
+## Post-Quantum Mode
+
+Enable post-quantum protection by setting `post_quantum = true`:
+
+```toml
+post_quantum = true
 ```
 
-The server opens two sockets:
+The handshake runs a CRYSTALS-Kyber-1024 KEM encapsulation alongside the standard X25519 ECDH. The final session key is derived from both shared secrets using HKDF, so security requires breaking both schemes simultaneously.
 
-| Socket | Purpose |
-|--------|---------|
-| `TCP 0.0.0.0:<server_port>` | WebSocket tunnel connections |
-| `UDP 0.0.0.0:<server_port - 1>` | Port-knock listener (non-fatal if bind fails) |
+Note: post-quantum mode increases handshake size and CPU cost. Using more than 3 relay hops with `post_quantum = true` may produce noticeably higher latency.
 
-**Port-knock enforcement** is disabled by default. Enable it by setting the environment variable:
+---
 
-```bash
-HVPN_REQUIRE_KNOCK=1 ./target/release/hvpn-server --config /etc/hvpn/server.toml
+## Certificate Pinning
+
+Add one or more SHA-256 fingerprints of your server's TLS certificate DER bytes:
+
+```toml
+cert_pin_fingerprints = [
+  "a3b4c5d6e7f8...64hexchars...",
+]
 ```
 
-When enabled, clients must send a valid probe token to the UDP port before the server accepts their TCP connection. The whitelist entry expires after 10 seconds.
-
-### 3. Logging
-
-Set the `RUST_LOG` environment variable to control verbosity:
+Obtain the fingerprint of a running server:
 
 ```bash
-RUST_LOG=info  ./target/release/hvpn-server   # default
-RUST_LOG=debug ./target/release/hvpn-server   # verbose
-RUST_LOG=warn  ./target/release/hvpn-server   # quiet
+openssl s_client -connect vpn.example.com:443 </dev/null 2>/dev/null \
+  | openssl x509 -fingerprint -sha256 -noout \
+  | sed 's/://g' | awk -F= '{print tolower($2)}'
+```
+
+When `cert_pin_fingerprints` is empty (the default), standard WebPKI verification is used.
+
+---
+
+## hvpn-ctl Command Reference
+
+`hvpn-ctl` communicates with a running `hvpn-client` daemon via a Unix socket at `/tmp/hvpn.sock`.
+
+| Command | Description |
+|---|---|
+| `hvpn-ctl status` | Show connection status, transport kind, RTT, bytes in/out, active streams. |
+| `hvpn-ctl connect --config <path>` | Instruct the daemon to connect using the specified config file. |
+| `hvpn-ctl disconnect` | Gracefully disconnect the active tunnel. |
+| `hvpn-ctl switch-transport <websocket\|http2\|grpc>` | Switch to a different transport while the tunnel is active. |
+| `hvpn-ctl relay-add --address <host:port> --pubkey-hex <hex>` | Append a hop to the active relay chain. |
+| `hvpn-ctl relay-clear` | Remove all relay hops (revert to direct connection). |
+
+---
+
+## Audit Trail
+
+Set the `HVPN_AUDIT_LOG` environment variable to a file path to enable file-based JSON-lines audit logging:
+
+```bash
+HVPN_AUDIT_LOG=/var/log/hvpn/audit.jsonl ./target/release/hvpn-server --config /etc/hvpn/server.toml
+```
+
+Without `HVPN_AUDIT_LOG`, audit events are written to stderr.
+
+Each line is a valid JSON object. Example events:
+
+```json
+{"event":"client_connected","peer_ip":"1.2.3.4","timestamp":1700000000}
+{"event":"knock_accepted","peer_ip":"1.2.3.4","timestamp":1700000001}
+{"event":"handshake_failed","peer_ip":"1.2.3.4","reason":"...","timestamp":1700000002}
+{"event":"client_disconnected","peer_ip":"1.2.3.4","reason":"clean close","timestamp":1700000100}
 ```
 
 ---
 
-## Running the Client
+## Deployment Guide
 
-### 1. Create a config file
-
-```bash
-cat > /etc/hvpn/client.toml << 'EOF'
-server_address = "vpn.example.com"
-server_port    = 443
-tls_cert_path  = "/etc/hvpn/server.pem"
-obfs_profile   = "browser"
-EOF
-```
-
-### 2. Start the client
+### Systemd (recommended)
 
 ```bash
-./target/release/hvpn-client --config /etc/hvpn/client.toml
+# Build release binaries
+cargo build --release
+
+# Install
+sudo bash deploy/install.sh
+
+# Configure
+sudo cp deploy/example-server.toml /etc/hvpn/server.toml
+sudo nano /etc/hvpn/server.toml  # set server_port, tls_cert_path, etc.
+
+# Enable and start
+sudo systemctl enable --now hvpn-server
+sudo journalctl -fu hvpn-server
 ```
 
-The client:
-1. Derives an ephemeral X25519 key pair.
-2. Connects to the server over WebSocket.
-3. Performs the crypto handshake (ephemeral public key exchanged as the first binary message).
-4. Enters the tunnel loop, reading packets from the TUN device and forwarding them encrypted.
-5. Shuts down cleanly on **Ctrl+C**.
+The service unit applies security hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `CAP_NET_ADMIN` and `CAP_NET_RAW` capabilities only.
 
-> **Phase 1 note:** The client uses `StubTun` (no real TUN device). It will connect to the server and run the tunnel loop, but no actual IP packets are routed. Real TUN support is Linux-only and gated behind `#[cfg(target_os = "linux")]` in `hvpn-tun`.
+### Debian Package
 
-If the server is unreachable, the client falls back to stub mode and logs:
-
-```
-transport not available (Phase 1 stub mode): ...
+```bash
+# Requires dpkg-deb
+bash deploy/build-deb.sh 0.1.0
+sudo dpkg -i hvpn_0.1.0_amd64.deb
 ```
 
 ---
@@ -158,74 +296,17 @@ transport not available (Phase 1 stub mode): ...
 
 ```bash
 # Run all workspace tests
-cargo test
+cargo test --workspace
 
 # Run tests for a specific crate
 cargo test -p hvpn-common
+cargo test -p hvpn-transport
 cargo test -p hvpn-crypto
 cargo test -p hvpn-core
-cargo test -p hvpn-server
 
-# Show test output (useful for debugging)
-cargo test -- --nocapture
+# Show test output
+cargo test --workspace -- --nocapture
 ```
-
-Key test coverage:
-- `hvpn-common` — config TOML round-trip, default obfs profile
-- `hvpn-crypto` — handshake, cipher, replay detection
-- `hvpn-server` — probe token replay rejection
-
----
-
-## End-to-End Smoke Test (local machine)
-
-Run the server and client in separate terminals on the same machine to verify the handshake and frame pipeline.
-
-**Terminal 1 — server:**
-
-```bash
-cat > /tmp/hvpn-server.toml << 'EOF'
-server_address = "127.0.0.1"
-server_port    = 9443
-tls_cert_path  = "/tmp/test.pem"
-obfs_profile   = "browser"
-EOF
-
-RUST_LOG=info cargo run --release -p hvpn-server -- --config /tmp/hvpn-server.toml
-```
-
-**Terminal 2 — client:**
-
-```bash
-cat > /tmp/hvpn-client.toml << 'EOF'
-server_address = "127.0.0.1"
-server_port    = 9443
-tls_cert_path  = "/tmp/test.pem"
-obfs_profile   = "browser"
-EOF
-
-RUST_LOG=info cargo run --release -p hvpn-client -- --config /tmp/hvpn-client.toml
-```
-
-Expected output (server side):
-
-```
-INFO hvpn_server: HVPN server listening addr=0.0.0.0:9443
-INFO hvpn_server: accepted TCP connection peer=127.0.0.1:xxxxx
-INFO hvpn_server: authenticated connection established peer=127.0.0.1:xxxxx
-INFO hvpn_server: crypto handshake complete peer=127.0.0.1:xxxxx
-```
-
-Expected output (client side):
-
-```
-INFO hvpn_client: starting HVPN client server=127.0.0.1 port=9443
-INFO hvpn_client: handshake keys derived pubkey=<hex>
-INFO hvpn_client: WebSocket transport connected
-INFO hvpn_client: entering tunnel loop (Ctrl+C to exit)
-```
-
-Press **Ctrl+C** in the client terminal to shut down gracefully.
 
 ---
 
@@ -234,26 +315,48 @@ Press **Ctrl+C** in the client terminal to shut down gracefully.
 ```
 HVPN/
 ├── Cargo.toml                  # Workspace manifest
+├── README.md                   # This file
+├── deploy/
+│   ├── hvpn-server.service     # Systemd unit for the server
+│   ├── hvpn-client.service     # Systemd unit for the client
+│   ├── install.sh              # Install script
+│   ├── build-deb.sh            # Debian package builder
+│   ├── example-server.toml     # Example server config
+│   └── example-client.toml     # Example client config
 ├── bins/
 │   ├── hvpn-client/            # Client binary
-│   └── hvpn-server/            # Server binary
+│   ├── hvpn-server/            # Server binary
+│   └── hvpn-ctl/               # Control CLI
 └── crates/
-    ├── hvpn-common/            # Config structs, error types
+    ├── hvpn-common/            # Config, error types, audit logger
     ├── hvpn-core/              # Frame codec, replay window, multiplexer
-    ├── hvpn-crypto/            # X25519 handshake, ChaCha20-Poly1305, probe tokens
+    ├── hvpn-crypto/            # X25519, ChaCha20-Poly1305, probe tokens, TLS ratchet
     ├── hvpn-metrics/           # RTT and packet-loss collector
     ├── hvpn-obfs/              # Traffic shaping and padding engine
-    ├── hvpn-pq/                # Post-quantum crypto (placeholder)
-    ├── hvpn-proto/             # Protobuf definitions (gRPC)
-    ├── hvpn-transport/         # WebSocket, HTTP/2, gRPC transport adapters
+    ├── hvpn-pq/                # Post-quantum KEM (CRYSTALS-Kyber + X25519 hybrid)
+    ├── hvpn-proto/             # Protobuf/gRPC definitions
+    ├── hvpn-relay/             # Onion relay routing
+    ├── hvpn-stego/             # Steganographic transport
+    ├── hvpn-transport/         # WebSocket, HTTP/2, gRPC adapters; cert pinning
     └── hvpn-tun/               # TUN device abstraction (Linux + stub)
 ```
 
 ---
 
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `RUST_LOG` | `info` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`. |
+| `HVPN_REQUIRE_KNOCK` | unset | Set to any value to require a valid port-knock before accepting TCP connections. |
+| `HVPN_AUDIT_LOG` | unset | Path for JSON-lines audit log file. Falls back to stderr if unset or if the file cannot be opened. |
+
+---
+
 ## Security Notes
 
-- Tokens include an HMAC-based timestamp (±30 s clock skew tolerated) and are checked against a replay cache for 60 seconds.
-- Non-HTTP connections receive a decoy nginx page instead of a protocol error.
-- Port-knock enforcement (`HVPN_REQUIRE_KNOCK=1`) limits exposure to scanners.
-- Phase 1 uses zero-byte static keys for development. A production deployment must load real keys from the config file.
+- Static server keys are zeroed in development. A production deployment must load real keys from the config file.
+- Tokens are HMAC-based with a ±30 second clock-skew window and are checked against a 60-second replay cache.
+- Non-HTTP connections receive a decoy nginx page to avoid protocol fingerprinting.
+- Certificate pinning defeats MITM by any CA (including rogue CAs), at the cost of requiring manual fingerprint updates on certificate rotation.
+- The `ProtectSystem=strict` systemd directive makes the filesystem read-only except for `ReadWritePaths`; review and expand `ReadWritePaths` if you write logs to a custom directory.

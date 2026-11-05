@@ -1,0 +1,24 @@
+[Unit]
+Description=HVPN Server — DPI-evasion VPN server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/hvpn-server --config /etc/hvpn/server.toml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+LimitNPROC=65536
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/hvpn /run/hvpn
+RuntimeDirectory=hvpn
+LogsDirectory=hvpn
+
+[Install]
+WantedBy=multi-user.target

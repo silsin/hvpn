@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+
+use crate::HvpnError;
 
 /// Obfuscation traffic-shaping profile.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +71,12 @@ pub struct Config {
     /// DNS servers to use over the tunnel (e.g. ["1.1.1.1", "8.8.8.8"]).
     #[serde(default)]
     pub dns_servers: Vec<String>,
+
+    /// SHA-256 certificate fingerprints for cert pinning (64 hex chars each).
+    /// When non-empty, the TLS connection is rejected unless the server cert
+    /// matches one of these fingerprints.
+    #[serde(default)]
+    pub cert_pin_fingerprints: Vec<String>,
 }
 
 fn default_tun_ip() -> String {
@@ -78,16 +87,144 @@ fn default_tun_netmask() -> String {
     "255.255.255.0".to_string()
 }
 
+/// Returns `true` if `s` consists entirely of lowercase hex characters and has the given length.
+fn is_hex_str(s: &str, expected_len: usize) -> bool {
+    s.len() == expected_len && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 impl Config {
     /// Parse a `Config` from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
     }
+
+    /// Validate the configuration, collecting all errors into a `Vec<String>`.
+    ///
+    /// Returns `Ok(())` when validation passes, or `Err(errors)` with every
+    /// problem found so the caller can report them all at once.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+
+        // 1. server_address must not be empty.
+        if self.server_address.is_empty() {
+            errors.push("server_address must not be empty".to_string());
+        }
+
+        // 2. server_port must be in range 1–65535 (u16, so only 0 is invalid).
+        if self.server_port == 0 {
+            errors.push("server_port must be between 1 and 65535".to_string());
+        }
+
+        // 3. tun_ip must be a valid IPv4 address.
+        if !self.tun_ip.is_empty()
+            && std::net::Ipv4Addr::from_str(&self.tun_ip).is_err()
+        {
+            errors.push("tun_ip is not a valid IPv4 address".to_string());
+        }
+
+        // 4. tun_netmask must be a valid IPv4 address.
+        if !self.tun_netmask.is_empty()
+            && std::net::Ipv4Addr::from_str(&self.tun_netmask).is_err()
+        {
+            errors.push("tun_netmask is not a valid IPv4 address".to_string());
+        }
+
+        // 5. dns_servers: each entry must be a valid IP address.
+        for (i, addr) in self.dns_servers.iter().enumerate() {
+            if std::net::IpAddr::from_str(addr).is_err() {
+                errors.push(format!(
+                    "dns_servers[{}] is not a valid IP address: {}",
+                    i, addr
+                ));
+            }
+        }
+
+        // 6. relay_chain: if Some, must have ≥1 hop; each hop's pubkey_hex must be 64 hex chars.
+        if let Some(ref hops) = self.relay_chain {
+            if hops.is_empty() {
+                errors.push("relay_chain must have at least 1 hop".to_string());
+            } else {
+                for (i, hop) in hops.iter().enumerate() {
+                    if !is_hex_str(&hop.pubkey_hex, 64) {
+                        errors.push(format!(
+                            "relay_chain[{}].pubkey_hex must be exactly 64 hex characters",
+                            i
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 7. cert_pin_fingerprints: each must be exactly 64 hex chars.
+        for (i, fp) in self.cert_pin_fingerprints.iter().enumerate() {
+            if !is_hex_str(fp, 64) {
+                errors.push(format!(
+                    "cert_pin_fingerprints[{}] must be exactly 64 hex characters",
+                    i
+                ));
+            }
+        }
+
+        // 8. WARN: post_quantum with >3 relay hops may have high latency.
+        if self.post_quantum {
+            if let Some(ref hops) = self.relay_chain {
+                if hops.len() > 3 {
+                    errors.push(
+                        "WARN: post_quantum with >3 relay hops may have high latency".to_string(),
+                    );
+                }
+            }
+        }
+
+        // 9. nat_enabled requires tun_ip.
+        if self.nat_enabled && self.tun_ip.is_empty() {
+            errors.push("nat_enabled requires tun_ip".to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Load a config file from `path`, parse it, and validate it.
+    ///
+    /// Returns the parsed `Config` on success, or an `HvpnError::Config` with
+    /// all validation errors joined by newlines on failure.
+    pub fn load_and_validate(path: &str) -> Result<Self, HvpnError> {
+        let raw = std::fs::read_to_string(path).map_err(|e| HvpnError::Io { source: e })?;
+        let cfg: Config =
+            toml::from_str(&raw).map_err(|e| HvpnError::Config(e.to_string()))?;
+        cfg.validate()
+            .map_err(|errors| HvpnError::Config(errors.join("\n")))?;
+        Ok(cfg)
+    }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Construct a minimal valid Config for use as a base in tests.
+    fn valid_config() -> Config {
+        Config {
+            server_address: "vpn.example.com".to_string(),
+            server_port: 443,
+            tls_cert_path: "/etc/hvpn/cert.pem".to_string(),
+            obfs_profile: ObfsProfile::Browser,
+            relay_chain: None,
+            stego_mode: false,
+            post_quantum: false,
+            nat_enabled: false,
+            tun_ip: "10.8.0.1".to_string(),
+            tun_netmask: "255.255.255.0".to_string(),
+            dns_servers: vec!["1.1.1.1".to_string()],
+            cert_pin_fingerprints: vec![],
+        }
+    }
 
     #[test]
     fn config_round_trip_from_toml() {
@@ -115,5 +252,97 @@ mod tests {
 
         let cfg = Config::from_toml_str(toml_str).expect("parse failed");
         assert_eq!(cfg.obfs_profile, ObfsProfile::Browser);
+    }
+
+    #[test]
+    fn test_config_validate_ok() {
+        let cfg = valid_config();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_missing_address() {
+        let mut cfg = valid_config();
+        cfg.server_address = "".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("server_address")));
+    }
+
+    #[test]
+    fn test_config_validate_bad_port() {
+        let mut cfg = valid_config();
+        cfg.server_port = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("server_port")));
+    }
+
+    #[test]
+    fn test_config_validate_bad_relay_pubkey() {
+        let mut cfg = valid_config();
+        cfg.relay_chain = Some(vec![RelayHopConfig {
+            address: "relay1.example.com:1234".to_string(),
+            pubkey_hex: "abc".to_string(), // only 3 chars, not 64
+        }]);
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("pubkey_hex")));
+    }
+
+    #[test]
+    fn test_config_validate_collects_all_errors() {
+        let cfg = Config {
+            server_address: "".to_string(), // error 1
+            server_port: 0,                 // error 2
+            tls_cert_path: "".to_string(),
+            obfs_profile: ObfsProfile::Browser,
+            relay_chain: Some(vec![RelayHopConfig {
+                address: "relay.example.com:9".to_string(),
+                pubkey_hex: "zz".to_string(), // error 3 (invalid hex + wrong length)
+            }]),
+            stego_mode: false,
+            post_quantum: false,
+            nat_enabled: false,
+            tun_ip: "10.8.0.1".to_string(),
+            tun_netmask: "255.255.255.0".to_string(),
+            dns_servers: vec![],
+            cert_pin_fingerprints: vec![],
+        };
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.len() >= 3,
+            "expected at least 3 errors, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_config_validate_bad_tun_ip() {
+        let mut cfg = valid_config();
+        cfg.tun_ip = "not-an-ip".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("tun_ip")));
+    }
+
+    #[test]
+    fn test_config_validate_bad_dns_server() {
+        let mut cfg = valid_config();
+        cfg.dns_servers = vec!["not-an-ip".to_string()];
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("dns_servers[0]")));
+    }
+
+    #[test]
+    fn test_config_validate_bad_cert_pin_fingerprint() {
+        let mut cfg = valid_config();
+        cfg.cert_pin_fingerprints = vec!["tooshort".to_string()];
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("cert_pin_fingerprints[0]")));
+    }
+
+    #[test]
+    fn test_config_validate_valid_cert_pin_fingerprint() {
+        let mut cfg = valid_config();
+        // 64 hex chars = valid SHA-256 fingerprint
+        cfg.cert_pin_fingerprints = vec!["a".repeat(64)];
+        assert!(cfg.validate().is_ok());
     }
 }

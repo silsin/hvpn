@@ -241,10 +241,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load configuration.
-    let raw = tokio::fs::read_to_string(&cli.config)
-        .await
-        .with_context(|| format!("reading config file {:?}", cli.config))?;
-    let cfg = Config::from_toml_str(&raw).with_context(|| "parsing config file")?;
+    let cfg = Config::load_and_validate(cli.config.to_str().unwrap_or("config.toml"))
+        .unwrap_or_else(|e| {
+            eprintln!("[hvpn-client] configuration error:\n{}", e);
+            std::process::exit(1);
+        });
 
     info!(
         server = %cfg.server_address,
