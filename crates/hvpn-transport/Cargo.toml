@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 hvpn-common           = { path = "../hvpn-common" }
+hvpn-crypto           = { path = "../hvpn-crypto" }
 tokio                 = { workspace = true }
 tokio-tungstenite     = { workspace = true }
 # Use the same rustls version as tokio-tungstenite@0.21 to avoid type conflicts.
