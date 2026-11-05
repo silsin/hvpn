@@ -121,7 +121,7 @@ async fn tunnel_loop(
         match tun.read_packet().await {
             Ok(pkt) => {
                 // Encrypt.
-                let ciphertext = encrypt_packet(keys, &pkt, *seq)
+                let ciphertext = encrypt_packet(keys, &pkt, *seq, None)
                     .context("encrypt failed")?;
 
                 // Wrap in a frame.

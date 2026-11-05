@@ -4,6 +4,8 @@ use chacha20poly1305::{
 };
 use hvpn_common::HvpnError;
 
+use crate::ratchet::RatchetState;
+
 /// Per-session symmetric keys derived from the ECDH handshake.
 #[derive(Clone)]
 pub struct SessionKeys {
@@ -25,14 +27,24 @@ fn nonce_from_seq(seq_num: u64) -> Nonce {
     *Nonce::from_slice(&nonce)
 }
 
-/// Encrypt `plaintext` using the session send key.
+/// Encrypt `plaintext` using the session send key (or a ratchet-derived key).
+///
+/// When `ratchet` is `Some`, a fresh per-packet key is derived via
+/// `ratchet.ratchet_send()` and used instead of `keys.send_key`.
+/// When `ratchet` is `None`, `keys.send_key` is used unchanged (backward compat).
+///
 /// Returns `ciphertext || tag` (ChaCha20-Poly1305 appends a 16-byte tag).
 pub fn encrypt_packet(
     keys: &SessionKeys,
     plaintext: &[u8],
     seq_num: u64,
+    ratchet: Option<&mut RatchetState>,
 ) -> Result<Vec<u8>, HvpnError> {
-    let key = Key::from_slice(&keys.send_key);
+    let raw_key: [u8; 32] = match ratchet {
+        Some(r) => r.ratchet_send(),
+        None => keys.send_key,
+    };
+    let key = Key::from_slice(&raw_key);
     let cipher = ChaCha20Poly1305::new(key);
     let nonce = nonce_from_seq(seq_num);
     cipher
@@ -40,14 +52,22 @@ pub fn encrypt_packet(
         .map_err(|e| HvpnError::Crypto(e.to_string()))
 }
 
-/// Decrypt `ciphertext` (which must include the 16-byte AEAD tag) using the
-/// session recv key.
+/// Decrypt `ciphertext` (which must include the 16-byte AEAD tag).
+///
+/// When `ratchet` is `Some`, a fresh per-packet key is derived via
+/// `ratchet.ratchet_recv()` and used instead of `keys.recv_key`.
+/// When `ratchet` is `None`, `keys.recv_key` is used unchanged (backward compat).
 pub fn decrypt_packet(
     keys: &SessionKeys,
     ciphertext: &[u8],
     seq_num: u64,
+    ratchet: Option<&mut RatchetState>,
 ) -> Result<Vec<u8>, HvpnError> {
-    let key = Key::from_slice(&keys.recv_key);
+    let raw_key: [u8; 32] = match ratchet {
+        Some(r) => r.ratchet_recv(),
+        None => keys.recv_key,
+    };
+    let key = Key::from_slice(&raw_key);
     let cipher = ChaCha20Poly1305::new(key);
     let nonce = nonce_from_seq(seq_num);
     cipher
@@ -74,8 +94,8 @@ mod tests {
         let plaintext = b"Hello, HVPN tunnel!";
         let seq = 42u64;
 
-        let ciphertext = encrypt_packet(&keys, plaintext, seq).expect("encrypt failed");
-        let decrypted = decrypt_packet(&keys, &ciphertext, seq).expect("decrypt failed");
+        let ciphertext = encrypt_packet(&keys, plaintext, seq, None).expect("encrypt failed");
+        let decrypted = decrypt_packet(&keys, &ciphertext, seq, None).expect("decrypt failed");
 
         assert_eq!(decrypted, plaintext);
     }
@@ -84,8 +104,8 @@ mod tests {
     fn wrong_seq_fails_decryption() {
         let keys = test_keys();
         let plaintext = b"sensitive data";
-        let ciphertext = encrypt_packet(&keys, plaintext, 1).expect("encrypt");
+        let ciphertext = encrypt_packet(&keys, plaintext, 1, None).expect("encrypt");
         // Using a different sequence number produces a different nonce → AEAD tag mismatch
-        assert!(decrypt_packet(&keys, &ciphertext, 2).is_err());
+        assert!(decrypt_packet(&keys, &ciphertext, 2, None).is_err());
     }
 }

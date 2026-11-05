@@ -190,7 +190,7 @@ async fn handle_authenticated(
                         }
 
                         // Decrypt payload.
-                        match decrypt_packet(&session_keys, &frame.payload, frame.seq) {
+                        match decrypt_packet(&session_keys, &frame.payload, frame.seq, None) {
                             Ok(plaintext) => {
                                 info!(
                                     %peer,
