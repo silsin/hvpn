@@ -17,8 +17,8 @@ mod service;
 mod install;
 
 use hvpn_common::{Config, RelayHopConfig};
-use hvpn_core::{Frame, FrameCodec, FrameType};
-use hvpn_crypto::{encrypt_packet, perform_handshake_client};
+use hvpn_core::{Frame, FrameCodec, FrameType, ReplayWindow};
+use hvpn_crypto::{encrypt_packet, perform_handshake_client, decrypt_packet};
 use hvpn_obfs::ObfsEngine;
 use hvpn_transport::{Transport, TransportConfig, WebSocketTransport};
 use hvpn_tun::{StubTun, TunDevice};
@@ -498,17 +498,75 @@ pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Resul
         });
     }
 
-    // NOTE: In Phase 1 we use StubTun so the binary compiles and runs on any
-    // platform, including the development machine.  The Linux /dev/net/tun
-    // path is gated behind #[cfg(target_os = "linux")] inside hvpn-tun.
+    // Open TUN device — WinTun on Windows, LinuxTun on Linux, StubTun as fallback.
+    #[cfg(target_os = "windows")]
+    let mut tun: Box<dyn TunDevice> = {
+        use hvpn_tun::WinTunDevice;
+        match WinTunDevice::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address).await {
+            Ok(dev) => {
+                info!("WinTun device opened successfully");
+                // Set default route through the VPN tunnel using server-side TUN IP as gateway.
+                match hvpn_tun::set_default_route("hvpn0", "10.8.0.1") {
+                    Ok(_) => info!("default route set through VPN tunnel"),
+                    Err(e) => {
+                        tracing::warn!("set_default_route failed: {}", e);
+                    }
+                }
+                // Set DNS servers.
+                if !cfg.dns_servers.is_empty() {
+                    let _ = hvpn_tun::set_dns("hvpn0", &cfg.dns_servers);
+                }
+                Box::new(dev)
+            }
+            Err(e) => {
+                tracing::warn!("WinTun not available ({}), using stub — traffic will NOT be routed", e);
+                Box::new(StubTun::new())
+            }
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let mut tun: Box<dyn TunDevice> = {
+        use hvpn_tun::LinuxTun;
+        match LinuxTun::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address).await {
+            Ok(dev) => {
+                info!("Linux TUN device opened successfully");
+                Box::new(dev)
+            }
+            Err(e) => {
+                tracing::warn!("TUN not available ({}), using stub", e);
+                Box::new(StubTun::new())
+            }
+        }
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let mut tun: Box<dyn TunDevice> = Box::new(StubTun::new());
 
     // Connect transport.
     let transport_cfg = TransportConfig::new(cfg.server_address.clone(), cfg.server_port, "/hvpn");
 
-    // For now we use a well-known dummy server public key (32 zero bytes).
-    // A real deployment would load this from the config file.
-    let server_pubkey = [0u8; 32];
+    // Load server pubkey from saved profiles if available, else use zeroed key.
+    let server_pubkey: [u8; 32] = {
+        let profiles = hvpn_common::load_profiles();
+        let matching = profiles.iter().find(|p| p.server == cfg.server_address);
+        if let Some(profile) = matching {
+            let bytes = (0..profile.pubkey.len())
+                .step_by(2)
+                .filter_map(|i| u8::from_str_radix(profile.pubkey.get(i..i+2)?, 16).ok())
+                .collect::<Vec<u8>>();
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                info!("using server pubkey from saved profile");
+                arr
+            } else {
+                tracing::warn!("saved profile pubkey invalid length, using zeroed key");
+                [0u8; 32]
+            }
+        } else {
+            tracing::warn!("no saved profile found for {}, using zeroed server pubkey — crypto handshake will fail", cfg.server_address);
+            [0u8; 32]
+        }
+    };
     let (ephemeral_pub, session_keys) = perform_handshake_client(&server_pubkey)
         .context("client handshake failed")?;
 
@@ -528,6 +586,13 @@ pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Resul
     let transport: Option<WebSocketTransport> = match transport_result {
         Ok(t) => {
             info!("WebSocket transport connected");
+            // Send our ephemeral pubkey to the server as the first message
+            // so the server can complete the X25519 handshake.
+            if let Err(e) = t.send(ephemeral_pub.to_vec()).await {
+                tracing::warn!("failed to send ephemeral pubkey to server: {}", e);
+            } else {
+                info!("crypto handshake pubkey sent to server");
+            }
             {
                 let mut s = state.lock().unwrap();
                 s.connected = true;
@@ -580,43 +645,83 @@ async fn tunnel_loop(
     keys: &hvpn_crypto::SessionKeys,
     state: Arc<Mutex<AppState>>,
 ) -> Result<()> {
+    use hvpn_core::{FrameType, ReplayWindow};
+    use hvpn_crypto::decrypt_packet;
+
+    let mut replay = ReplayWindow::new();
+
     loop {
-        // Read a packet from TUN.
-        match tun.read_packet().await {
-            Ok(pkt) => {
-                // Encrypt.
-                let ciphertext =
-                    encrypt_packet(keys, &pkt, *seq, None).context("encrypt failed")?;
-
-                // Wrap in a frame.
-                let frame = Frame {
-                    seq: *seq,
-                    stream_id: 0,
-                    frame_type: FrameType::Data,
-                    flags: 0,
-                    payload: ciphertext,
-                    padding: vec![],
-                };
-                let encoded = codec.encode(&frame);
-
-                // Obfuscate.
-                let padded = obfs.pad_packet(encoded);
-
-                // Send.
-                if let Some(t) = transport {
-                    let len = padded.len() as u64;
-                    t.send(padded).await.context("send failed")?;
-                    let mut s = state.lock().unwrap();
-                    s.bytes_out = s.bytes_out.wrapping_add(len);
+        if let Some(t) = transport {
+            // Run TUN→server and server→TUN concurrently.
+            tokio::select! {
+                // Outbound: TUN packet → encrypt → send to server
+                tun_result = tun.read_packet() => {
+                    match tun_result {
+                        Ok(pkt) if !pkt.is_empty() => {
+                            let ciphertext = encrypt_packet(keys, &pkt, *seq, None)
+                                .context("encrypt failed")?;
+                            let frame = Frame {
+                                seq: *seq,
+                                stream_id: 0,
+                                frame_type: FrameType::Data,
+                                flags: 0,
+                                payload: ciphertext,
+                                padding: vec![],
+                            };
+                            let encoded = codec.encode(&frame);
+                            let padded = obfs.pad_packet(encoded);
+                            let len = padded.len() as u64;
+                            t.send(padded).await.context("send failed")?;
+                            let mut s = state.lock().unwrap();
+                            s.bytes_out = s.bytes_out.wrapping_add(len);
+                            *seq = seq.wrapping_add(1);
+                        }
+                        Ok(_) => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        }
+                    }
                 }
-
-                obfs.apply_jitter().await;
-                *seq = seq.wrapping_add(1);
+                // Inbound: recv from server → decrypt → write to TUN
+                recv_result = t.recv() => {
+                    match recv_result {
+                        Ok(data) => {
+                            let unpadded = obfs.unpad_packet(data);
+                            match codec.decode(&unpadded) {
+                                Ok(frame) => {
+                                    if frame.frame_type == FrameType::Data {
+                                        if replay.check_and_advance(frame.seq).is_ok() {
+                                            match decrypt_packet(keys, &frame.payload, frame.seq, None) {
+                                                Ok(ip_pkt) => {
+                                                    let len = ip_pkt.len() as u64;
+                                                    tun.write_packet(&ip_pkt).await
+                                                        .context("tun write failed")?;
+                                                    let mut s = state.lock().unwrap();
+                                                    s.bytes_in = s.bytes_in.wrapping_add(len);
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("decrypt failed: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("frame decode failed: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("transport recv failed: {}", e));
+                        }
+                    }
+                }
             }
-            Err(_) => {
-                // StubTun is empty — yield to avoid busy-loop.
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
+        } else {
+            // No transport — just drain TUN to avoid blocking.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
 }

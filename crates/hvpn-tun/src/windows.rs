@@ -169,26 +169,208 @@ fn reader_loop(session: Arc<wintun::Session>, tx: mpsc::Sender<Vec<u8>>) {
 
 // ── Route / DNS helpers (Step 2) ───────────────────────────────────────────────
 
-/// Install a default route (`0.0.0.0/0`) through the WinTun interface.
+/// Look up the Windows interface index for an adapter by its friendly name.
+pub fn get_interface_index(iface_name: &str) -> Result<u32, HvpnError> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, GAA_FLAG_INCLUDE_ALL_INTERFACES,
+        GET_ADAPTERS_ADDRESSES_FLAGS,
+    };
+    use windows::Win32::Networking::WinSock::AF_UNSPEC;
+    use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+
+    let mut buf_len: u32 = 15000;
+    let mut buf: Vec<u8> = vec![0u8; buf_len as usize];
+    let flags = GET_ADAPTERS_ADDRESSES_FLAGS(GAA_FLAG_INCLUDE_ALL_INTERFACES.0);
+
+    // First call may return ERROR_BUFFER_OVERFLOW with the required size.
+    let mut result = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC.0 as u32,
+            flags,
+            None,
+            Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+            &mut buf_len,
+        )
+    };
+    if result == ERROR_BUFFER_OVERFLOW.0 {
+        buf.resize(buf_len as usize, 0);
+        result = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC.0 as u32,
+                flags,
+                None,
+                Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+                &mut buf_len,
+            )
+        };
+    }
+    if result != 0 {
+        return Err(HvpnError::Tun(format!("GetAdaptersAddresses failed: {}", result)));
+    }
+
+    // Walk the linked list.
+    let mut ptr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !ptr.is_null() {
+        let adapter = unsafe { &*ptr };
+        let friendly = unsafe { adapter.FriendlyName.to_string() }
+            .unwrap_or_default();
+        if friendly.eq_ignore_ascii_case(iface_name) {
+            return Ok(unsafe { adapter.Anonymous1.Anonymous.IfIndex });
+        }
+        ptr = adapter.Next;
+    }
+    Err(HvpnError::Tun(format!("interface '{}' not found", iface_name)))
+}
+
+/// Set a fixed metric on a network interface, disabling automatic metric selection.
+pub fn set_interface_metric(iface_index: u32, metric: u32) -> Result<(), HvpnError> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetIpInterfaceEntry, SetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+    use windows::Win32::Foundation::NO_ERROR;
+
+    let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
+    row.Family = AF_INET;
+    row.InterfaceIndex = iface_index;
+
+    let result = unsafe { GetIpInterfaceEntry(&mut row) };
+    if result != NO_ERROR {
+        return Err(HvpnError::Tun(format!("GetIpInterfaceEntry failed: {:?}", result)));
+    }
+
+    row.Metric = metric;
+    row.UseAutomaticMetric = false.into();
+
+    let result = unsafe { SetIpInterfaceEntry(&mut row) };
+    if result != NO_ERROR {
+        return Err(HvpnError::Tun(format!("SetIpInterfaceEntry failed: {:?}", result)));
+    }
+    Ok(())
+}
+
+/// Install a default route (`0.0.0.0/0`) through the WinTun interface using the
+/// Windows IP Helper API. This avoids the metric problems caused by `route add`.
 pub fn set_default_route(iface_name: &str, gateway_ip: &str) -> Result<(), HvpnError> {
-    run_cmd(
-        "netsh",
-        &[
-            "interface",
-            "ip",
-            "add",
-            "route",
-            "0.0.0.0/0",
-            iface_name,
-            gateway_ip,
-        ],
-    )
+    use windows::Win32::NetworkManagement::IpHelper::{
+        CreateIpForwardEntry, DeleteIpForwardEntry, GetIpForwardTable,
+        MIB_IPFORWARDROW, MIB_IPFORWARDTABLE,
+    };
+    use std::net::Ipv4Addr;
+
+    let iface_index = get_interface_index(iface_name)?;
+
+    let gw_addr: Ipv4Addr = gateway_ip.parse()
+        .map_err(|_| HvpnError::Tun(format!("invalid gateway IP: {}", gateway_ip)))?;
+    // Windows DWORD fields store IPv4 addresses in network byte order (big-endian).
+    let gw_dword = u32::from_be_bytes(gw_addr.octets());
+
+    // Delete any existing 0.0.0.0/0 routes through this interface.
+    let mut table_size: u32 = 0;
+    let _ = unsafe { GetIpForwardTable(None, &mut table_size, false) };
+    let mut table_buf: Vec<u8> = vec![0u8; table_size as usize];
+    let ret = unsafe {
+        GetIpForwardTable(
+            Some(table_buf.as_mut_ptr() as *mut MIB_IPFORWARDTABLE),
+            &mut table_size,
+            false,
+        )
+    };
+    if ret == 0 {
+        let table = table_buf.as_ptr() as *const MIB_IPFORWARDTABLE;
+        let n_rows = unsafe { (*table).dwNumEntries } as usize;
+        let rows_ptr = unsafe { (*table).table.as_ptr() };
+        for i in 0..n_rows {
+            let row = unsafe { &*rows_ptr.add(i) };
+            if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardIfIndex == iface_index {
+                let _ = unsafe { DeleteIpForwardEntry(row as *const MIB_IPFORWARDROW) };
+            }
+        }
+    }
+
+    // Build the new default route entry.
+    let mut row: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
+    row.dwForwardDest     = 0;   // 0.0.0.0
+    row.dwForwardMask     = 0;   // 0.0.0.0
+    row.dwForwardNextHop  = gw_dword;
+    row.dwForwardIfIndex  = iface_index;
+    row.dwForwardMetric1  = 1;
+    row.Anonymous1.dwForwardType     = 4;   // MIB_IPROUTE_TYPE_INDIRECT
+    row.Anonymous2.dwForwardProto    = 3;   // MIB_IPPROTO_NETMGMT
+
+    let ret = unsafe { CreateIpForwardEntry(&row) };
+    if ret != 0 {
+        return Err(HvpnError::Tun(format!("CreateIpForwardEntry failed: {}", ret)));
+    }
+    Ok(())
 }
 
 /// Add a host route for `server_ip` via the physical gateway so traffic to the
 /// VPN server bypasses the tunnel (prevents routing recursion).
 pub fn exclude_server_route(server_ip: &str, gateway: &str) -> Result<(), HvpnError> {
-    run_cmd("route", &["add", server_ip, gateway, "metric", "0"])
+    use windows::Win32::NetworkManagement::IpHelper::{
+        CreateIpForwardEntry, DeleteIpForwardEntry, GetIpForwardTable,
+        MIB_IPFORWARDROW, MIB_IPFORWARDTABLE,
+    };
+    use std::net::Ipv4Addr;
+
+    let srv_addr: Ipv4Addr = server_ip.parse()
+        .map_err(|_| HvpnError::Tun(format!("invalid server IP: {}", server_ip)))?;
+    let gw_addr: Ipv4Addr = gateway.parse()
+        .map_err(|_| HvpnError::Tun(format!("invalid gateway: {}", gateway)))?;
+    let srv_dword = u32::from_be_bytes(srv_addr.octets());
+    let gw_dword  = u32::from_be_bytes(gw_addr.octets());
+    // 255.255.255.255 — all octets 0xFF so byte order is irrelevant.
+    let host_mask_dword = u32::from_be_bytes([255, 255, 255, 255]);
+
+    // Find the physical interface index and remove any stale server host route.
+    let mut phys_iface_index: u32 = 0;
+    let mut table_size: u32 = 0;
+    let _ = unsafe { GetIpForwardTable(None, &mut table_size, false) };
+    let mut table_buf: Vec<u8> = vec![0u8; table_size as usize];
+    let ret = unsafe {
+        GetIpForwardTable(
+            Some(table_buf.as_mut_ptr() as *mut MIB_IPFORWARDTABLE),
+            &mut table_size,
+            false,
+        )
+    };
+    if ret == 0 {
+        let table = table_buf.as_ptr() as *const MIB_IPFORWARDTABLE;
+        let n_rows = unsafe { (*table).dwNumEntries } as usize;
+        let rows_ptr = unsafe { (*table).table.as_ptr() };
+        // Find the physical default route (0.0.0.0/0) that goes via the given gateway.
+        for i in 0..n_rows {
+            let row = unsafe { &*rows_ptr.add(i) };
+            if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardNextHop == gw_dword {
+                phys_iface_index = row.dwForwardIfIndex;
+                break;
+            }
+        }
+        // Delete any existing host route for server_ip.
+        for i in 0..n_rows {
+            let row = unsafe { &*rows_ptr.add(i) };
+            if row.dwForwardDest == srv_dword && row.dwForwardMask == host_mask_dword {
+                let _ = unsafe { DeleteIpForwardEntry(row as *const MIB_IPFORWARDROW) };
+            }
+        }
+    }
+
+    // Add a host route for server_ip via the physical gateway.
+    let mut row: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
+    row.dwForwardDest     = srv_dword;
+    row.dwForwardMask     = host_mask_dword;
+    row.dwForwardNextHop  = gw_dword;
+    row.dwForwardIfIndex  = phys_iface_index; // 0 is acceptable; Windows will pick the right one
+    row.dwForwardMetric1  = 1;
+    row.Anonymous1.dwForwardType     = 4; // MIB_IPROUTE_TYPE_INDIRECT
+    row.Anonymous2.dwForwardProto    = 3; // MIB_IPPROTO_NETMGMT
+
+    let ret = unsafe { CreateIpForwardEntry(&row) };
+    if ret != 0 {
+        return Err(HvpnError::Tun(format!("CreateIpForwardEntry for server route failed: {}", ret)));
+    }
+    Ok(())
 }
 
 /// Configure DNS servers for the WinTun interface.
@@ -276,19 +458,23 @@ fn parse_default_gateway(route_print_output: &str) -> Option<String> {
 
 /// Assign a static IPv4 address and netmask to `iface_name` via `netsh`.
 fn set_interface_ip(iface_name: &str, ip: &str, netmask: &str) -> Result<(), HvpnError> {
+    // Set static IP address.
     run_cmd(
         "netsh",
         &[
-            "interface",
-            "ip",
-            "set",
-            "address",
+            "interface", "ip", "set", "address",
             &format!("name=\"{}\"", iface_name),
-            "static",
-            ip,
-            netmask,
+            "static", ip, netmask,
         ],
-    )
+    )?;
+
+    // Set the interface metric via the IP Helper API so Windows cannot
+    // override it with automatic metric selection.
+    if let Ok(idx) = get_interface_index(iface_name) {
+        let _ = set_interface_metric(idx, 1);
+    }
+
+    Ok(())
 }
 
 /// Split an address that may be in CIDR form (`"10.8.0.2/24"`) into an IP and a
