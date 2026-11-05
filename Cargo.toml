@@ -14,6 +14,7 @@ members = [
     "crates/hvpn-relay",
     "bins/hvpn-client",
     "bins/hvpn-server",
+    "bins/hvpn-ctl",
 ]
 
 [workspace.dependencies]
