@@ -1,9 +1,1 @@
-   Compiling hvpn-common v0.1.0 (D:\HVPN\crates\hvpn-common)
-   Compiling hvpn-crypto v0.1.0 (D:\HVPN\crates\hvpn-crypto)
-   Compiling hvpn-obfs v0.1.0 (D:\HVPN\crates\hvpn-obfs)
-   Compiling hvpn-tun v0.1.0 (D:\HVPN\crates\hvpn-tun)
-   Compiling hvpn-core v0.1.0 (D:\HVPN\crates\hvpn-core)
-   Compiling hvpn-transport v0.1.0 (D:\HVPN\crates\hvpn-transport)
-   Compiling hvpn-server v0.1.0 (D:\HVPN\bins\hvpn-server)
-   Compiling hvpn-client v0.1.0 (D:\HVPN\bins\hvpn-client)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 42.68s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.51s

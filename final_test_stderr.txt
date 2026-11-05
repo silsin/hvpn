@@ -1,27 +1,27 @@
-   Compiling hvpn-client v0.1.0 (D:\HVPN\bins\hvpn-client)
-   Compiling hvpn-transport v0.1.0 (D:\HVPN\crates\hvpn-transport)
-   Compiling hvpn-obfs v0.1.0 (D:\HVPN\crates\hvpn-obfs)
-   Compiling hvpn-tun v0.1.0 (D:\HVPN\crates\hvpn-tun)
-   Compiling hvpn-core v0.1.0 (D:\HVPN\crates\hvpn-core)
-   Compiling hvpn-server v0.1.0 (D:\HVPN\bins\hvpn-server)
-   Compiling hvpn-crypto v0.1.0 (D:\HVPN\crates\hvpn-crypto)
-   Compiling hvpn-common v0.1.0 (D:\HVPN\crates\hvpn-common)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.08s
-     Running unittests src\main.rs (target\debug\deps\hvpn_client-d9cdf7cb67fc6ddb.exe)
-     Running unittests src\lib.rs (target\debug\deps\hvpn_common-07e512883cbf6456.exe)
-     Running unittests src\lib.rs (target\debug\deps\hvpn_core-12807cf26b0bc65a.exe)
-     Running unittests src\lib.rs (target\debug\deps\hvpn_crypto-a4fa40aaad74bec9.exe)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.98s
+     Running unittests src\main.rs (target\debug\deps\hvpn_client-47282cf9abf2d758.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_common-f130764ef292e254.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_core-562bb4702a74bbbd.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_crypto-ad36911698910ecc.exe)
+     Running unittests src\main.rs (target\debug\deps\hvpn_ctl-fb917cebdc7c3076.exe)
      Running unittests src\lib.rs (target\debug\deps\hvpn_metrics-04e07a2b5944ccdb.exe)
-     Running unittests src\lib.rs (target\debug\deps\hvpn_obfs-f8ccec27f4be6886.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_obfs-ffb0c4ffee936ccb.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_pq-13e1d8d9bb5b0137.exe)
      Running unittests src\lib.rs (target\debug\deps\hvpn_proto-5d66c5ea494246c0.exe)
-     Running unittests src\main.rs (target\debug\deps\hvpn_server-33881d02aead5831.exe)
-     Running unittests src\lib.rs (target\debug\deps\hvpn_transport-03eb4990395a0ba0.exe)
-     Running unittests src\lib.rs (target\debug\deps\hvpn_tun-5adbee5b81f242f9.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_relay-9982b083fee53a14.exe)
+     Running unittests src\main.rs (target\debug\deps\hvpn_server-a4ffc81c32cdca66.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_stego-92b477857ce7a245.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_transport-6733cab6e86af13b.exe)
+     Running unittests src\main.rs (target\debug\deps\hvpn_tray-961e01211e6b0afd.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_tun-3677ae14944d9baf.exe)
    Doc-tests hvpn_common
    Doc-tests hvpn_core
    Doc-tests hvpn_crypto
    Doc-tests hvpn_metrics
    Doc-tests hvpn_obfs
+   Doc-tests hvpn_pq
    Doc-tests hvpn_proto
+   Doc-tests hvpn_relay
+   Doc-tests hvpn_stego
    Doc-tests hvpn_transport
    Doc-tests hvpn_tun
