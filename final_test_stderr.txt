@@ -1,0 +1,27 @@
+   Compiling hvpn-client v0.1.0 (D:\HVPN\bins\hvpn-client)
+   Compiling hvpn-transport v0.1.0 (D:\HVPN\crates\hvpn-transport)
+   Compiling hvpn-obfs v0.1.0 (D:\HVPN\crates\hvpn-obfs)
+   Compiling hvpn-tun v0.1.0 (D:\HVPN\crates\hvpn-tun)
+   Compiling hvpn-core v0.1.0 (D:\HVPN\crates\hvpn-core)
+   Compiling hvpn-server v0.1.0 (D:\HVPN\bins\hvpn-server)
+   Compiling hvpn-crypto v0.1.0 (D:\HVPN\crates\hvpn-crypto)
+   Compiling hvpn-common v0.1.0 (D:\HVPN\crates\hvpn-common)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.08s
+     Running unittests src\main.rs (target\debug\deps\hvpn_client-d9cdf7cb67fc6ddb.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_common-07e512883cbf6456.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_core-12807cf26b0bc65a.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_crypto-a4fa40aaad74bec9.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_metrics-04e07a2b5944ccdb.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_obfs-f8ccec27f4be6886.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_proto-5d66c5ea494246c0.exe)
+     Running unittests src\main.rs (target\debug\deps\hvpn_server-33881d02aead5831.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_transport-03eb4990395a0ba0.exe)
+     Running unittests src\lib.rs (target\debug\deps\hvpn_tun-5adbee5b81f242f9.exe)
+   Doc-tests hvpn_common
+   Doc-tests hvpn_core
+   Doc-tests hvpn_crypto
+   Doc-tests hvpn_metrics
+   Doc-tests hvpn_obfs
+   Doc-tests hvpn_proto
+   Doc-tests hvpn_transport
+   Doc-tests hvpn_tun

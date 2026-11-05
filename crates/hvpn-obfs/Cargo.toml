@@ -8,3 +8,4 @@ hvpn-common = { path = "../hvpn-common" }
 tokio       = { workspace = true }
 rand        = { workspace = true }
 thiserror   = { workspace = true }
+flate2      = "1.0.28"

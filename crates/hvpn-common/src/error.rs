@@ -37,4 +37,8 @@ pub enum HvpnError {
     /// Configuration parse error.
     #[error("config error: {0}")]
     Config(String),
+
+    /// Protocol-level error (bad framing, unknown flags, etc.).
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
