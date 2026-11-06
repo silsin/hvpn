@@ -102,7 +102,7 @@ mod linux_nat {
     /// bring the interface up, and return the raw file descriptor for reuse.
     fn open_tun_interface(iface_name: &str, tun_ip: &str) -> Result<std::os::unix::io::RawFd, String> {
         use std::fs::OpenOptions;
-        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::io::{AsRawFd, IntoRawFd};
 
         let file = OpenOptions::new()
             .read(true)
