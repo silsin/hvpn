@@ -17,7 +17,7 @@ pub use linux::LinuxTun;
 pub use windows::WinTunDevice;
 
 #[cfg(target_os = "windows")]
-pub use windows::{exclude_server_route, get_default_gateway, set_default_route, set_dns};
+pub use windows::{exclude_server_route, get_default_gateway, set_default_route, set_dns, get_interface_index, set_interface_metric};
 
 /// Platform-native TUN device type alias.
 ///

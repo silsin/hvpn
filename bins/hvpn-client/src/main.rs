@@ -507,22 +507,30 @@ pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Resul
                 info!("WinTun device opened successfully");
                 // Wait for the WinTun adapter to fully initialise before touching the routing table.
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                // Set default route through the VPN tunnel using server-side TUN IP as gateway.
+
+                // Get real gateway BEFORE setting VPN default route (otherwise VPN wins and gateway lookup returns VPN).
+                let real_gateway = hvpn_tun::get_default_gateway().ok();
+                info!("real gateway detected: {:?}", real_gateway);
+
+                // FIRST: add server exclusion route via real gateway.
+                if let Some(ref gateway) = real_gateway {
+                    // Delete stale route first.
+                    let _ = std::process::Command::new("route")
+                        .args(["delete", &cfg.server_address])
+                        .output();
+                    match std::process::Command::new("route")
+                        .args(["add", &cfg.server_address, "mask", "255.255.255.255", gateway, "metric", "1"])
+                        .output() {
+                        Ok(o) if o.status.success() => info!("server exclusion route set via {}", gateway),
+                        Ok(o) => tracing::warn!("route add server exclusion failed: {}", String::from_utf8_lossy(&o.stdout)),
+                        Err(e) => tracing::warn!("route add server exclusion error: {}", e),
+                    }
+                }
+
+                // SECOND: set VPN default route.
                 match hvpn_tun::set_default_route("hvpn0", "10.8.0.1") {
                     Ok(_) => info!("default route set through VPN tunnel OK"),
-                    Err(e) => {
-                        tracing::warn!("set_default_route failed: {}", e);
-                        // Try direct API as last resort
-                        if let Ok(idx) = hvpn_tun::get_interface_index("hvpn0") {
-                            info!("hvpn0 interface index = {}", idx);
-                            match hvpn_tun::set_interface_metric(idx, 1) {
-                                Ok(_) => info!("interface metric set to 1"),
-                                Err(e) => tracing::warn!("set_interface_metric failed: {}", e),
-                            }
-                        } else {
-                            tracing::warn!("could not find hvpn0 interface index");
-                        }
-                    }
+                    Err(e) => tracing::warn!("set_default_route failed: {}", e),
                 }
                 // Set DNS servers.
                 if !cfg.dns_servers.is_empty() {

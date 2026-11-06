@@ -334,71 +334,107 @@ pub fn set_default_route(iface_name: &str, gateway_ip: &str) -> Result<(), HvpnE
 /// VPN server bypasses the tunnel (prevents routing recursion).
 pub fn exclude_server_route(server_ip: &str, gateway: &str) -> Result<(), HvpnError> {
     use windows::Win32::NetworkManagement::IpHelper::{
-        CreateIpForwardEntry, DeleteIpForwardEntry, GetIpForwardTable,
-        MIB_IPFORWARDROW, MIB_IPFORWARDTABLE,
+        ConvertInterfaceIndexToLuid,
+        CreateIpForwardEntry2, DeleteIpForwardEntry2,
+        GetIpForwardTable2, FreeMibTable,
+        InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
     };
+    use windows::Win32::Networking::WinSock::{
+        AF_INET, SOCKADDR_INET, ADDRESS_FAMILY, NL_ROUTE_PROTOCOL,
+    };
+    use windows::Win32::Foundation::NO_ERROR;
     use std::net::Ipv4Addr;
 
     let srv_addr: Ipv4Addr = server_ip.parse()
         .map_err(|_| HvpnError::Tun(format!("invalid server IP: {}", server_ip)))?;
     let gw_addr: Ipv4Addr = gateway.parse()
         .map_err(|_| HvpnError::Tun(format!("invalid gateway: {}", gateway)))?;
-    // MIB_IPFORWARDROW uses host byte order (little-endian on x86).
-    let srv_dword = u32::from_ne_bytes(srv_addr.octets());
-    let gw_dword  = u32::from_ne_bytes(gw_addr.octets());
-    let host_mask_dword = u32::from_ne_bytes([255, 255, 255, 255]);
 
-    // Find the physical interface index and remove any stale server host route.
+    let af_inet = ADDRESS_FAMILY(AF_INET.0);
+
+    // Find the physical interface index for the gateway.
     let mut phys_iface_index: u32 = 0;
-    let mut table_size: u32 = 0;
-    let _ = unsafe { GetIpForwardTable(None, &mut table_size, false) };
-    let mut table_buf: Vec<u8> = vec![0u8; table_size as usize];
-    let ret = unsafe {
-        GetIpForwardTable(
-            Some(table_buf.as_mut_ptr() as *mut MIB_IPFORWARDTABLE),
-            &mut table_size,
-            false,
-        )
-    };
-    if ret == 0 {
-        let table = table_buf.as_ptr() as *const MIB_IPFORWARDTABLE;
-        let n_rows = unsafe { (*table).dwNumEntries } as usize;
-        let rows_ptr = unsafe { (*table).table.as_ptr() };
-        // Find the physical default route (0.0.0.0/0) that goes via the given gateway.
-        for i in 0..n_rows {
-            let row = unsafe { &*rows_ptr.add(i) };
-            if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardNextHop == gw_dword {
-                phys_iface_index = row.dwForwardIfIndex;
-                break;
+    let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let ret = unsafe { GetIpForwardTable2(af_inet, &mut table_ptr) };
+    if ret == NO_ERROR && !table_ptr.is_null() {
+        let table = unsafe { &*table_ptr };
+        let rows = unsafe {
+            std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize)
+        };
+        for row in rows {
+            let prefix_len = row.DestinationPrefix.PrefixLength;
+            let family = unsafe { row.DestinationPrefix.Prefix.si_family };
+            if prefix_len == 0 && family == af_inet {
+                let nh_family = unsafe { row.NextHop.si_family };
+                if nh_family == af_inet {
+                    let nh_bytes = unsafe { row.NextHop.Ipv4.sin_addr.S_un.S_addr };
+                    let nh_ip = Ipv4Addr::from(u32::from_be(nh_bytes));
+                    if nh_ip == gw_addr {
+                        phys_iface_index = row.InterfaceIndex;
+                        break;
+                    }
+                }
             }
         }
         // Delete any existing host route for server_ip.
-        for i in 0..n_rows {
-            let row = unsafe { &*rows_ptr.add(i) };
-            if row.dwForwardDest == srv_dword && row.dwForwardMask == host_mask_dword {
-                let _ = unsafe { DeleteIpForwardEntry(row as *const MIB_IPFORWARDROW) };
+        for row in rows {
+            if row.DestinationPrefix.PrefixLength == 32 {
+                let family = unsafe { row.DestinationPrefix.Prefix.si_family };
+                if family == af_inet {
+                    let addr_bytes = unsafe {
+                        row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr
+                    };
+                    let addr = Ipv4Addr::from(u32::from_be(addr_bytes));
+                    if addr == srv_addr {
+                        let _ = unsafe { DeleteIpForwardEntry2(row as *const MIB_IPFORWARD_ROW2) };
+                    }
+                }
             }
         }
+        unsafe { FreeMibTable(table_ptr as *const _) };
     }
 
-    // Add a host route for server_ip via the physical gateway.
-    let mut row: MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
-    row.dwForwardDest     = srv_dword;
-    row.dwForwardMask     = host_mask_dword;
-    row.dwForwardNextHop  = gw_dword;
-    row.dwForwardIfIndex  = phys_iface_index;
-    row.dwForwardMetric1  = 1;
-    row.dwForwardMetric2  = u32::MAX;
-    row.dwForwardMetric3  = u32::MAX;
-    row.dwForwardMetric4  = u32::MAX;
-    row.dwForwardMetric5  = u32::MAX;
-    row.Anonymous1.dwForwardType     = 4;
-    row.Anonymous2.dwForwardProto    = 3;
-    row.dwForwardAge      = u32::MAX;
+    if phys_iface_index == 0 {
+        return Err(HvpnError::Tun(format!("could not find physical interface for gateway {}", gateway)));
+    }
 
-    let ret = unsafe { CreateIpForwardEntry(&row) };
-    if ret != 0 {
-        return Err(HvpnError::Tun(format!("CreateIpForwardEntry for server route failed: {}", ret)));
+    // Get LUID for physical interface.
+    let mut luid = unsafe { std::mem::zeroed() };
+    let ret = unsafe { ConvertInterfaceIndexToLuid(phys_iface_index, &mut luid) };
+    if ret != NO_ERROR {
+        return Err(HvpnError::Tun(format!("ConvertInterfaceIndexToLuid failed: {:?}", ret)));
+    }
+
+    // Build host route for server_ip via physical gateway.
+    let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+    unsafe { InitializeIpForwardEntry(&mut row) };
+
+    row.InterfaceLuid = luid;
+    row.InterfaceIndex = phys_iface_index;
+
+    // Destination: server_ip/32
+    row.DestinationPrefix.PrefixLength = 32;
+    let mut dest_sa: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+    dest_sa.si_family = af_inet;
+    let srv_bytes = u32::to_be(u32::from_ne_bytes(srv_addr.octets()));
+    unsafe { dest_sa.Ipv4.sin_addr.S_un.S_addr = srv_bytes };
+    row.DestinationPrefix.Prefix = dest_sa;
+
+    // Next hop: gateway
+    let mut nh_sa: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+    nh_sa.si_family = af_inet;
+    let gw_bytes = u32::to_be(u32::from_ne_bytes(gw_addr.octets()));
+    unsafe { nh_sa.Ipv4.sin_addr.S_un.S_addr = gw_bytes };
+    row.NextHop = nh_sa;
+
+    row.Metric = 1;
+    row.Protocol = NL_ROUTE_PROTOCOL(3);
+    row.ValidLifetime = 0xFFFF_FFFFu32;
+    row.PreferredLifetime = 0xFFFF_FFFFu32;
+
+    let result = unsafe { CreateIpForwardEntry2(&row) };
+    if result != NO_ERROR {
+        return Err(HvpnError::Tun(format!("CreateIpForwardEntry2 for server route failed: {:?}", result)));
     }
     Ok(())
 }
