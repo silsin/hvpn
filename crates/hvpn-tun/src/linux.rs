@@ -63,9 +63,12 @@ impl LinuxTun {
 
         let ret = unsafe { libc_ioctl(raw_fd, TUNSETIFF, &ifr as *const Ifreq as u64) };
         if ret < 0 {
+            // errno -1 can mean the interface already exists and is busy.
+            // Try attaching to the existing interface by opening with the same name.
+            let errno = unsafe { *libc::__errno_location() };
             return Err(HvpnError::Tun(format!(
                 "TUNSETIFF ioctl failed: errno {}",
-                ret
+                errno
             )));
         }
 

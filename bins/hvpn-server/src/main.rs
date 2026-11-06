@@ -56,6 +56,9 @@ struct ServerState {
     /// Present only on Linux when `config.nat_enabled = true`.
     #[cfg(target_os = "linux")]
     nat_router: Option<Arc<nat::NatRouter>>,
+    /// Shared TUN device for NAT forwarding (Linux only).
+    #[cfg(target_os = "linux")]
+    shared_tun: Option<Arc<tokio::sync::Mutex<hvpn_tun::LinuxTun>>>,
 }
 
 #[tokio::main]
@@ -128,6 +131,23 @@ async fn main() -> Result<()> {
         None
     };
 
+    // ── Open shared TUN device once (Linux only) ───────────────────────────
+    #[cfg(target_os = "linux")]
+    let shared_tun: Option<Arc<tokio::sync::Mutex<hvpn_tun::LinuxTun>>> = if cfg.nat_enabled {
+        match hvpn_tun::LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await {
+            Ok(tun) => {
+                info!("shared TUN device opened for NAT forwarding");
+                Some(Arc::new(tokio::sync::Mutex::new(tun)))
+            }
+            Err(e) => {
+                warn!("could not open shared TUN device: {} — NAT forwarding disabled", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Nonce / replay cache: maps 32-byte token → UNIX timestamp of first use.
     let nonce_cache: Arc<DashMap<[u8; 32], u64>> = Arc::new(DashMap::new());
 
@@ -137,6 +157,8 @@ async fn main() -> Result<()> {
         nonce_cache,
         #[cfg(target_os = "linux")]
         nat_router,
+        #[cfg(target_os = "linux")]
+        shared_tun,
     });
 
     // ── Audit logger ──────────────────────────────────────────────────────
@@ -436,123 +458,104 @@ async fn handle_authenticated(
         // Assign this client a VPN IP.
         let _client_ip = router.assign_client_ip(peer_addr);
 
-        // Open two independent TUN file descriptors: one for each direction.
-        let tun_read = LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await;
-        let tun_write = LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await;
-
-        match (tun_read, tun_write) {
-            (Ok(mut tun_r), Ok(mut tun_w)) => {
-                let keys_a = session_keys.clone(); // for TUN→client
-                let keys_b = session_keys.clone(); // for client→TUN
-                let peer_a = peer.clone();
-                let peer_b = peer.clone();
-                let router_b = router.clone();
-                let client_addr = peer_addr;
-
-                // Task A: server TUN → client WS (read plaintext, encrypt, send)
-                let tun_to_client = tokio::spawn(async move {
-                    // Per-task codec and obfs engine built from copied keys.
-                    let codec_a = FrameCodec::new(keys_a.header_key);
-                    let mut obfs_a = ObfsEngine::new();
-                    // Outbound sequence counter for TUN→client direction.
-                    let mut out_seq: u64 = 0;
-                    loop {
-                        match tun_r.read_packet().await {
-                            Ok(ip_pkt) => {
-                                match hvpn_crypto::encrypt_packet(&keys_a, &ip_pkt, out_seq, None) {
-                                    Ok(ciphertext) => {
-                                        let frame = Frame {
-                                            seq: out_seq,
-                                            stream_id: 0,
-                                            frame_type: FrameType::Data,
-                                            flags: 0,
-                                            payload: ciphertext,
-                                            padding: vec![],
-                                        };
-                                        let encoded = codec_a.encode(&frame);
-                                        let padded = obfs_a.pad_packet(encoded);
-                                        if sink.send(Message::Binary(padded)).await.is_err() {
-                                            break;
-                                        }
-                                        out_seq = out_seq.wrapping_add(1);
-                                    }
-                                    Err(e) => warn!(peer = %peer_a, "encrypt error: {}", e),
-                                }
-                            }
-                            Err(e) => {
-                                warn!(peer = %peer_a, "TUN read error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                // Task B: client WS → server TUN (receive, decrypt, write)
-                let client_to_tun = tokio::spawn(async move {
-                    let codec_b = FrameCodec::new(keys_b.header_key);
-                    let obfs_b = ObfsEngine::new();
-                    let mut replay = hvpn_core::ReplayWindow::new();
-                    while let Some(msg) = source.next().await {
-                        match msg {
-                            Ok(Message::Binary(data)) => {
-                                let unpadded = obfs_b.unpad_packet(data);
-                                match codec_b.decode(&unpadded) {
-                                    Ok(frame) => {
-                                        if let Err(e) = replay.check_and_advance(frame.seq) {
-                                            warn!(peer = %peer_b, "replay: {}", e);
-                                            continue;
-                                        }
-                                        match hvpn_crypto::decrypt_packet(
-                                            &keys_b,
-                                            &frame.payload,
-                                            frame.seq,
-                                            None,
-                                        ) {
-                                            Ok(ip_pkt) => {
-                                                if let Err(e) = tun_w.write_packet(&ip_pkt).await {
-                                                    warn!(peer = %peer_b, "TUN write: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) => warn!(peer = %peer_b, "decrypt: {}", e),
-                                        }
-                                    }
-                                    Err(e) => warn!(peer = %peer_b, "frame decode: {}", e),
-                                }
-                            }
-                            Ok(Message::Close(_)) => {
-                                info!(peer = %peer_b, "client closed NAT connection");
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!(peer = %peer_b, "ws error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    router_b.release_client_ip(&client_addr);
-                });
-
-                tokio::select! {
-                    _ = tun_to_client => {}
-                    _ = client_to_tun => {}
-                }
-                info!(%peer, "NAT connection closed");
-                audit.log(AuditEvent::ClientDisconnected {
-                    peer_ip: peer_addr.ip().to_string(),
-                    reason: "clean close".to_string(),
-                    timestamp: AuditLogger::current_timestamp(),
-                });
+        // Use the shared TUN device.
+        let shared_tun = match state.shared_tun.as_ref() {
+            Some(t) => Arc::clone(t),
+            None => {
+                warn!(%peer, "shared TUN not available — falling back to log loop");
+                // fall through to log loop below
+                drop(router);
                 return Ok(());
             }
-            (Err(e), _) | (_, Err(e)) => {
-                warn!(%peer,
-                    "could not open TUN for NAT forwarding: {} — falling back to log loop",
-                    e
-                );
+        };
+
+        let keys_a = session_keys.clone();
+        let keys_b = session_keys.clone();
+        let peer_a = peer.clone();
+        let peer_b = peer.clone();
+        let router_b = router.clone();
+        let client_addr = peer_addr;
+        let tun_a = Arc::clone(&shared_tun);
+        let tun_b = Arc::clone(&shared_tun);
+
+        // Task A: server TUN → client WS
+        let tun_to_client = tokio::spawn(async move {
+            let codec_a = FrameCodec::new(keys_a.header_key);
+            let mut obfs_a = ObfsEngine::new();
+            let mut out_seq: u64 = 0;
+            loop {
+                let ip_pkt = {
+                    let mut tun = tun_a.lock().await;
+                    match tun.read_packet().await {
+                        Ok(p) => p,
+                        Err(e) => { warn!(peer = %peer_a, "TUN read: {}", e); break; }
+                    }
+                };
+                match hvpn_crypto::encrypt_packet(&keys_a, &ip_pkt, out_seq, None) {
+                    Ok(ciphertext) => {
+                        let frame = Frame {
+                            seq: out_seq,
+                            stream_id: 0,
+                            frame_type: FrameType::Data,
+                            flags: 0,
+                            payload: ciphertext,
+                            padding: vec![],
+                        };
+                        let encoded = codec_a.encode(&frame);
+                        let padded = obfs_a.pad_packet(encoded);
+                        if sink.send(Message::Binary(padded)).await.is_err() { break; }
+                        out_seq = out_seq.wrapping_add(1);
+                    }
+                    Err(e) => warn!(peer = %peer_a, "encrypt: {}", e),
+                }
             }
+        });
+
+        // Task B: client WS → server TUN
+        let client_to_tun = tokio::spawn(async move {
+            let codec_b = FrameCodec::new(keys_b.header_key);
+            let obfs_b = ObfsEngine::new();
+            let mut replay = hvpn_core::ReplayWindow::new();
+            while let Some(msg) = source.next().await {
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        let unpadded = obfs_b.unpad_packet(data);
+                        match codec_b.decode(&unpadded) {
+                            Ok(frame) => {
+                                if replay.check_and_advance(frame.seq).is_err() { continue; }
+                                match hvpn_crypto::decrypt_packet(&keys_b, &frame.payload, frame.seq, None) {
+                                    Ok(ip_pkt) => {
+                                        let mut tun = tun_b.lock().await;
+                                        if let Err(e) = tun.write_packet(&ip_pkt).await {
+                                            warn!(peer = %peer_b, "TUN write: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => warn!(peer = %peer_b, "decrypt: {}", e),
+                                }
+                            }
+                            Err(e) => warn!(peer = %peer_b, "frame decode: {}", e),
+                        }
+                    }
+                    Ok(Message::Close(_)) => { info!(peer = %peer_b, "client closed"); break; }
+                    Ok(_) => {}
+                    Err(e) => { warn!(peer = %peer_b, "ws error: {}", e); break; }
+                }
+            }
+            router_b.release_client_ip(&client_addr);
+        });
+
+        tokio::select! {
+            _ = tun_to_client => {}
+            _ = client_to_tun => {}
         }
+        info!(%peer, "NAT connection closed");
+        audit.log(AuditEvent::ClientDisconnected {
+            peer_ip: peer_addr.ip().to_string(),
+            reason: "clean close".to_string(),
+            timestamp: AuditLogger::current_timestamp(),
+        });
+        return Ok(());
     }
 
     // ── Phase-1 log-only loop (NAT disabled or TUN unavailable) ───────────
