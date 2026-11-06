@@ -768,15 +768,7 @@ where
                         Err(e) => { warn!(peer = %peer_a, "TUN read: {}", e); break; }
                     }
                 };
-                // Derive the per-packet encryption key from the send ratchet.
-                let msg_key = ratchet_send_a.lock().unwrap().next_key();
-                let ratchet_session = hvpn_crypto::SessionKeys {
-                    send_key: msg_key,
-                    recv_key: [0u8; 32],
-                    header_key: keys_a.header_key,
-                    mac_key: keys_a.mac_key,
-                };
-                match hvpn_crypto::encrypt_packet(&ratchet_session, &ip_pkt, out_seq, None) {
+                match hvpn_crypto::encrypt_packet(&keys_a, &ip_pkt, out_seq, None) {
                     Ok(ciphertext) => {
                         let frame = Frame {
                             seq: out_seq,
@@ -809,15 +801,7 @@ where
                         match codec_b.decode(&unpadded) {
                             Ok(frame) => {
                                 if replay.check_and_advance(frame.seq).is_err() { continue; }
-                                // Derive the per-packet decryption key from the recv ratchet.
-                                let msg_key = ratchet_recv_b.lock().unwrap().next_key();
-                                let ratchet_session = hvpn_crypto::SessionKeys {
-                                    send_key: [0u8; 32],
-                                    recv_key: msg_key,
-                                    header_key: keys_b.header_key,
-                                    mac_key: keys_b.mac_key,
-                                };
-                                match hvpn_crypto::decrypt_packet(&ratchet_session, &frame.payload, frame.seq, None) {
+                                match hvpn_crypto::decrypt_packet(&keys_b, &frame.payload, frame.seq, None) {
                                     Ok(ip_pkt) => {
                                         if let Err(e) = tun_b.write_packet(&ip_pkt).await {
                                             warn!(peer = %peer_b, "TUN write: {}", e);
@@ -866,15 +850,7 @@ where
                             warn!(%peer, "replay: {}", e);
                             continue;
                         }
-                        // Derive the per-packet decryption key from the recv ratchet.
-                        let msg_key = ratchet_recv.lock().unwrap().next_key();
-                        let ratchet_session = hvpn_crypto::SessionKeys {
-                            send_key: [0u8; 32],
-                            recv_key: msg_key,
-                            header_key: session_keys.header_key,
-                            mac_key: session_keys.mac_key,
-                        };
-                        match decrypt_packet(&ratchet_session, &frame.payload, frame.seq, None) {
+                        match decrypt_packet(&session_keys, &frame.payload, frame.seq, None) {
                             Ok(plaintext) => {
                                 info!(
                                     %peer,
@@ -1217,6 +1193,7 @@ mod tests {
         let _ = std::fs::remove_file(&key_path);
     }
 }
+
 
 
 
