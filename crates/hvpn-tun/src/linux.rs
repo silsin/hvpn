@@ -44,7 +44,6 @@ impl LinuxTun {
         })
     }
 
-impl LinuxTun {
     /// Open and configure a new TUN device.
     ///
     /// - `iface_name` — desired interface name (e.g. `"hvpn0"`); empty means kernel-assigned.
