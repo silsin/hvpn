@@ -150,6 +150,9 @@ fn build_rustls_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<rus
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the ring crypto provider for rustls before any TLS operations.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
