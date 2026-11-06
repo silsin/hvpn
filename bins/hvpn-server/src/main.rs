@@ -463,13 +463,18 @@ async fn handle_authenticated(
             }
         };
 
-        // Open a second fd to hvpn0 for writing (client→internet direction).
-        let tun_write = match hvpn_tun::LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(%peer, "could not open write TUN fd: {} — falling back to log loop", e);
-                drop(router);
-                return Ok(());
+        // Duplicate the TUN fd for writing (client→internet direction).
+        // dup() creates a new fd pointing to the same kernel interface,
+        // avoiding EBUSY from trying to TUNSETIFF an already-bound interface.
+        let tun_write = {
+            let tun = shared_tun.lock().await;
+            match tun.try_clone() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(%peer, "could not dup TUN fd: {} — falling back to log loop", e);
+                    drop(router);
+                    return Ok(());
+                }
             }
         };
 

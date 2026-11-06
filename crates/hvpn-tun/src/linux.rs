@@ -44,6 +44,25 @@ impl LinuxTun {
         })
     }
 
+    /// Duplicate the underlying file descriptor using `dup()` syscall.
+    /// Returns a new `LinuxTun` that shares the same kernel TUN interface
+    /// but has an independent fd, allowing concurrent read and write
+    /// without mutex contention.
+    pub fn try_clone(&self) -> Result<Self, HvpnError> {
+        let new_fd = unsafe { libc::dup(self.file.as_raw_fd()) };
+        if new_fd < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            return Err(HvpnError::Tun(format!("dup() failed: errno {}", errno)));
+        }
+        use std::os::unix::io::FromRawFd;
+        let std_file = unsafe { std::fs::File::from_raw_fd(new_fd) };
+        let async_file = File::from_std(std_file);
+        Ok(Self {
+            file: async_file,
+            ifname: self.ifname.clone(),
+        })
+    }
+
     /// Open and configure a new TUN device.
     ///
     /// - `iface_name` — desired interface name (e.g. `"hvpn0"`); empty means kernel-assigned.
@@ -76,8 +95,6 @@ impl LinuxTun {
 
         let ret = unsafe { libc_ioctl(raw_fd, TUNSETIFF, &ifr as *const Ifreq as u64) };
         if ret < 0 {
-            // errno -1 can mean the interface already exists and is busy.
-            // Try attaching to the existing interface by opening with the same name.
             let errno = unsafe { *libc::__errno_location() };
             return Err(HvpnError::Tun(format!(
                 "TUNSETIFF ioctl failed: errno {}",
