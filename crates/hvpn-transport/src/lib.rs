@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 pub use transport_trait::Transport;
-pub use websocket::{CertVerifier, TransportConfig, WebSocketTransport};
+pub use websocket::{CertVerifier, DangerVerifier, TransportConfig, WebSocketTransport};
 pub use http2::Http2Transport;
 pub use grpc::GrpcTransport;
 pub use hvpn_crypto::{build_tls_config_raw, TlsProfile, TlsProfileConfig};

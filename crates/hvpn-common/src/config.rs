@@ -83,6 +83,12 @@ pub struct Config {
     /// does not have a TLS certificate (plain WebSocket).
     #[serde(default = "default_use_tls")]
     pub use_tls: bool,
+
+    /// Accept any server TLS certificate without validation (useful for
+    /// self-signed certificates).  Defaults to `true` so that self-signed
+    /// setups work out of the box.
+    #[serde(default = "default_accept_invalid_certs")]
+    pub accept_invalid_certs: bool,
 }
 
 fn default_tun_ip() -> String {
@@ -94,6 +100,10 @@ fn default_tun_netmask() -> String {
 }
 
 fn default_use_tls() -> bool {
+    true
+}
+
+fn default_accept_invalid_certs() -> bool {
     true
 }
 
@@ -220,6 +230,10 @@ pub struct ConnectionProfile {
     /// Hex-encoded Ed25519 server public key (64 hex chars).
     pub pubkey: String,
     pub version: u8,
+    /// Hex-encoded 32-byte shared auth secret (64 hex chars).
+    /// Used to generate/validate HMAC-based connection tokens.
+    #[serde(default)]
+    pub auth_secret: String,
     /// User-assigned display name (not part of the wire format).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -250,6 +264,7 @@ impl ConnectionProfile {
             "port": self.port,
             "pubkey": self.pubkey,
             "version": self.version,
+            "auth_secret": self.auth_secret,
         });
         URL_SAFE_NO_PAD.encode(wire.to_string().as_bytes())
     }
@@ -265,6 +280,14 @@ impl ConnectionProfile {
         if self.pubkey.len() != 64 || !self.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(HvpnError::Config(
                 "pubkey must be exactly 64 hex characters".to_string(),
+            ));
+        }
+        // auth_secret must be exactly 64 hex chars.
+        if self.auth_secret.len() != 64
+            || !self.auth_secret.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(HvpnError::Config(
+                "auth_secret must be exactly 64 hex characters".to_string(),
             ));
         }
         Ok(())
@@ -334,6 +357,7 @@ mod tests {
             dns_servers: vec!["1.1.1.1".to_string()],
             cert_pin_fingerprints: vec![],
             use_tls: true,
+            accept_invalid_certs: true,
         }
     }
 
@@ -417,6 +441,7 @@ mod tests {
             dns_servers: vec![],
             cert_pin_fingerprints: vec![],
             use_tls: true,
+            accept_invalid_certs: true,
         };
         let errs = cfg.validate().unwrap_err();
         assert!(
@@ -465,6 +490,7 @@ mod tests {
             port: 443,
             pubkey: "a".repeat(64),
             version: 1,
+            auth_secret: "b".repeat(64),
             name: Some("my server".to_string()),
         };
         let s = profile.to_connection_string();
@@ -473,6 +499,7 @@ mod tests {
         assert_eq!(decoded.port, profile.port);
         assert_eq!(decoded.pubkey, profile.pubkey);
         assert_eq!(decoded.version, profile.version);
+        assert_eq!(decoded.auth_secret, profile.auth_secret);
         // name is not part of the wire format
         assert!(decoded.name.is_none());
     }
@@ -484,6 +511,7 @@ mod tests {
             port: 443,
             pubkey: "a".repeat(63), // 63 chars, not 64
             version: 1,
+            auth_secret: "d".repeat(64),
             name: None,
         };
         let err = profile.validate().unwrap_err();
@@ -503,6 +531,7 @@ mod tests {
                 port: 443,
                 pubkey: "a".repeat(64),
                 version: 1,
+                auth_secret: "c".repeat(64),
                 name: Some("server-a".to_string()),
             },
             ConnectionProfile {
@@ -510,6 +539,7 @@ mod tests {
                 port: 1194,
                 pubkey: "b".repeat(64),
                 version: 1,
+                auth_secret: "e".repeat(64),
                 name: Some("server-b".to_string()),
             },
         ];

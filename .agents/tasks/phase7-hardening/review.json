@@ -1,0 +1,10 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    "bins/hvpn-server/src/main.rs:88-90 — ensure_tls_cert calls rcgen::generate_simple_self_signed which generates an ECDSA P-256 certificate. The brief specifies RSA 2048. Fix: use rcgen::CertificateParams with KeyPair generated from rcgen::PKCS_RSA_SHA256 or rcgen::RsaKeySize::_2048 instead of the default generator.",
+    "bins/hvpn-server/src/main.rs:513-517 and 607-611 — In both handle_connection_tls and handle_connection_plain, the accept_hdr_async callback sets *resp.status_mut() = http::StatusCode::FORBIDDEN but still returns Ok(resp). In tokio-tungstenite 0.23, returning Ok(resp) causes the library to overwrite the status with 101 and complete the WebSocket upgrade regardless; the client receives 101 + WS close frame, not a 403 HTTP response. The callback must return Err(resp) to propagate the rejection back to the HTTP layer. Correct the Err(reason) arm in both locations to: `*resp.status_mut() = http::StatusCode::FORBIDDEN; return Err(resp);` and handle the resulting accept_hdr_async Err variant in the outer match.",
+    "deploy/staging/example-client.toml:2 — The base64-decoded connection string comment contains no auth_secret field ({\"port\":443,\"pubkey\":\"...\",\"server\":\"...\",\"version\":1}). ConnectionProfile::validate requires auth_secret to be exactly 64 hex chars, so from_connection_string will return a validation error for this string. Regenerate the example profile with --setup (post-Phase-7) so the embedded connection string includes a valid auth_secret.",
+    "Verification evidence is absent — the prior step output was empty. The brief requires cargo build --workspace (0 errors) and cargo test --workspace (all tests pass including test_auth_token_validation, test_ratchet_active, and test_tls_self_signed) to be recorded before approval."
+  ],
+  "reviewDoc": "d:\\HVPN\\.agents\\tasks\\phase7-hardening\\review.md"
+}

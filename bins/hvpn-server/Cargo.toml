@@ -30,6 +30,13 @@ qrcode         = "0.14.1"
 base64         = "0.22.1"
 x25519-dalek   = { workspace = true }
 rand           = { workspace = true }
+rcgen          = "0.13.1"
+tokio-rustls   = "0.26.0"
+hmac           = { workspace = true }
+sha2           = { workspace = true }
+
+[dev-dependencies]
+hvpn-transport = { path = "../../crates/hvpn-transport" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.153"

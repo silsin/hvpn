@@ -15,7 +15,7 @@ SetCompressor lzma
 !include "MUI2.nsh"
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "LICENSE"
+!insertmacro MUI_PAGE_LICENSE "..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -31,6 +31,7 @@ Section "Install" SecInstall
   File "staging\hvpn-client.exe"
   File "staging\hvpn-tray.exe"
   File "staging\hvpn-ctl.exe"
+  File "staging\wintun.dll"
 
   ; Create APPDATA config directory
   CreateDirectory "$APPDATA\HVPN"
@@ -80,6 +81,7 @@ Section "Uninstall"
   Delete "$INSTDIR\hvpn-client.exe"
   Delete "$INSTDIR\hvpn-tray.exe"
   Delete "$INSTDIR\hvpn-ctl.exe"
+  Delete "$INSTDIR\wintun.dll"
   Delete "$INSTDIR\Uninstall.exe"
 
   ; Delete shortcuts

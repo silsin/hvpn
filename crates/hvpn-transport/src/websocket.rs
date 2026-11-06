@@ -22,6 +22,58 @@ use crate::transport_trait::Transport;
 use crate::DomainFrontConfig;
 use crate::CertPin;
 
+// ── Accept-any-cert verifier ──────────────────────────────────────────────────
+
+/// A `ServerCertVerifier` that accepts any certificate without validation.
+/// Used when `danger_accept_invalid_certs = true` (e.g. self-signed server cert).
+#[derive(Debug)]
+pub struct DangerVerifier;
+
+impl ServerCertVerifier for DangerVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+        ]
+    }
+}
+
 // ── Certificate pinning verifier ──────────────────────────────────────────────
 
 /// A custom `ServerCertVerifier` that enforces SHA-256 certificate fingerprint
@@ -123,6 +175,12 @@ pub struct TransportConfig {
     /// Optional certificate fingerprint pin. When `Some`, the `CertVerifier`
     /// is installed as a custom verifier.
     pub cert_pin: Option<CertPin>,
+    /// When `true`, skip all TLS certificate verification — useful for
+    /// self-signed server certificates.
+    pub danger_accept_invalid_certs: bool,
+    /// Shared auth secret (32 bytes) used to mint HMAC-based `X-Auth-Token` headers.
+    /// When `None`, no auth header is sent (backwards-compatible fallback).
+    pub auth_secret: Option<[u8; 32]>,
 }
 
 impl TransportConfig {
@@ -133,8 +191,41 @@ impl TransportConfig {
             path: path.into(),
             tls_cert_override: None,
             cert_pin: None,
+            danger_accept_invalid_certs: false,
+            auth_secret: None,
         }
     }
+}
+
+// ── Auth token helper ─────────────────────────────────────────────────────────
+
+/// Generate a 40-byte auth token: `timestamp_le(8) || HMAC-SHA256(secret, ts || [0u8;16])(32)`.
+/// Returns the token hex-encoded (80 hex chars).
+fn generate_auth_token(auth_secret: &[u8; 32]) -> String {
+    use hmac::{Hmac, Mac};
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts_le = ts.to_le_bytes(); // 8 bytes, little-endian
+
+    // HMAC input: timestamp_le (8 bytes) || zero nonce (16 bytes)
+    let mut mac_input = [0u8; 24];
+    mac_input[..8].copy_from_slice(&ts_le);
+    // bytes [8..24] remain zero (zero nonce)
+
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(auth_secret)
+        .expect("HMAC accepts any key length");
+    mac.update(&mac_input);
+    let hmac_bytes: [u8; 32] = mac.finalize().into_bytes().into();
+
+    // Token = ts_le(8) || hmac(32) = 40 bytes total → 80 hex chars
+    let mut token = [0u8; 40];
+    token[..8].copy_from_slice(&ts_le);
+    token[8..].copy_from_slice(&hmac_bytes);
+
+    token.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // ── WebSocketTransport ────────────────────────────────────────────────────────
@@ -161,30 +252,14 @@ impl WebSocketTransport {
             .into_client_request()
             .map_err(|e| HvpnError::Transport(e.to_string()))?;
 
-        // Phase 1: use a fixed shared mac_key that matches the server's fallback.
-        // The server derives mac_key via HKDF from a zeroed ECDH shared secret.
-        // Both sides use the same zeroed input → same HKDF output.
-        let mac_key: [u8; 32] = {
-            use hkdf::Hkdf;
-            use sha2::Sha512;
-            let shared_secret = [0u8; 32]; // zeroed server secret + zeroed ephemeral = zero shared
-            let hk = Hkdf::<Sha512>::new(None, &shared_secret);
-            let mut okm = [0u8; 128];
-            let _ = hk.expand(b"HVPN-v1-session-keys", &mut okm);
-            let mut mac_key = [0u8; 32];
-            mac_key.copy_from_slice(&okm[96..128]);
-            mac_key
-        };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let nonce = [0u8; 16];
-        let token = hvpn_crypto::generate_probe_token(&mac_key, ts, &nonce);
-        let token_hex: String = token.iter().map(|b| format!("{:02x}", b)).collect();
-
         let headers = request.headers_mut();
-        headers.insert("X-Auth-Token", token_hex.parse().unwrap());
+
+        // Send X-Auth-Token when an auth secret is configured.
+        if let Some(ref secret) = cfg.auth_secret {
+            let token_hex = generate_auth_token(secret);
+            headers.insert("X-Auth-Token", token_hex.parse().unwrap());
+        }
+
         headers.insert(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -242,11 +317,23 @@ impl WebSocketTransport {
                 .unwrap(),
         );
 
+        // Send X-Auth-Token when an auth secret is configured.
+        if let Some(ref secret) = cfg.auth_secret {
+            let token_hex = generate_auth_token(secret);
+            headers.insert("X-Auth-Token", token_hex.parse().unwrap());
+        }
+
         // Build the rustls TLS connector.
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let tls_config = if let Some(ref pin) = cfg.cert_pin {
+        let tls_config = if cfg.danger_accept_invalid_certs {
+            // Skip all cert verification — needed for self-signed server certificates.
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(DangerVerifier))
+                .with_no_client_auth()
+        } else if let Some(ref pin) = cfg.cert_pin {
             // Install a custom cert verifier that enforces fingerprint pinning.
             rustls::ClientConfig::builder()
                 .dangerous()

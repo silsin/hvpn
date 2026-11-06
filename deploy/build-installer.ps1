@@ -33,6 +33,7 @@ $ReleaseDir = Join-Path $RepoRoot 'target\release'
 Copy-Item (Join-Path $ReleaseDir 'hvpn-client.exe') $Staging -Force
 Copy-Item (Join-Path $ReleaseDir 'hvpn-tray.exe')   $Staging -Force
 Copy-Item (Join-Path $ReleaseDir 'hvpn-ctl.exe')    $Staging -Force
+Copy-Item (Join-Path $ReleaseDir 'wintun.dll')       $Staging -Force
 
 # Copy example config if it exists
 $ExampleConfig = Join-Path $RepoRoot 'example-client.toml'
