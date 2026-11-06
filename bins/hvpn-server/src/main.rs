@@ -86,8 +86,27 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding to {}", bind_addr))?;
 
-    // Server static X25519 key (zeroed in Phase 1; loaded from config in Phase 2).
-    let server_secret_bytes = [0u8; 32];
+    // Server static X25519 key — load from /etc/hvpn/server_x25519.key if present.
+    let server_secret_bytes: [u8; 32] = std::fs::read_to_string("/etc/hvpn/server_x25519.key")
+        .ok()
+        .and_then(|s| {
+            let hex = s.trim();
+            if hex.len() == 64 {
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i+2], 16).ok())
+                    .collect();
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(arr)
+                } else { None }
+            } else { None }
+        })
+        .unwrap_or_else(|| {
+            tracing::warn!("X25519 private key not found at /etc/hvpn/server_x25519.key — using zeroed key (run 'hvpn-server setup' to generate)");
+            [0u8; 32]
+        });
 
     // Derive a stable mac_key from the server secret for probe-token verification.
     let mac_key: [u8; 32] = {
@@ -212,11 +231,19 @@ fn run_setup() -> anyhow::Result<()> {
     use hvpn_crypto::KeyPair;
     use qrcode::QrCode;
     use qrcode::render::unicode;
+    use x25519_dalek::{StaticSecret, PublicKey};
+    use rand::rngs::OsRng;
 
-    // Generate fresh Ed25519 server keypair.
+    // Generate fresh Ed25519 server keypair (for identity).
     let kp = KeyPair::generate();
-    let pubkey_bytes = kp.public_key_bytes();
-    let pubkey_hex: String = pubkey_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let ed_pubkey_bytes = kp.public_key_bytes();
+    let ed_pubkey_hex: String = ed_pubkey_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Generate fresh X25519 keypair (for tunnel handshake).
+    let x25519_secret = StaticSecret::random_from_rng(OsRng);
+    let x25519_public = PublicKey::from(&x25519_secret);
+    let x25519_secret_hex: String = x25519_secret.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+    let x25519_pubkey_hex: String = x25519_public.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
 
     // Detect public IP.
     let ip = reqwest::blocking::get("https://api.ipify.org")?.text()?;
@@ -224,7 +251,14 @@ fn run_setup() -> anyhow::Result<()> {
 
     let port: u16 = 443;
 
-    // Write server config file.
+    #[cfg(target_os = "windows")]
+    let config_dir = std::path::PathBuf::from(r"C:\ProgramData\hvpn");
+    #[cfg(not(target_os = "windows"))]
+    let config_dir = std::path::PathBuf::from("/etc/hvpn");
+
+    std::fs::create_dir_all(&config_dir)?;
+
+    // Write server config.
     #[cfg(target_os = "windows")]
     let tls_cert_path = r"C:\ProgramData\hvpn\server.pem";
     #[cfg(not(target_os = "windows"))]
@@ -239,44 +273,38 @@ dns_servers = ["1.1.1.1", "8.8.8.8"]
 tun_ip = "10.8.0.1"
 tun_netmask = "255.255.255.0"
 "#,
-        ip = ip,
-        port = port,
-        tls_cert = tls_cert_path,
+        ip = ip, port = port, tls_cert = tls_cert_path,
     );
+    std::fs::write(config_dir.join("server.toml"), &config_content)?;
 
-    #[cfg(target_os = "windows")]
-    let config_dir = std::path::PathBuf::from(r"C:\ProgramData\hvpn");
-    #[cfg(not(target_os = "windows"))]
-    let config_dir = std::path::PathBuf::from("/etc/hvpn");
+    // Write Ed25519 public key.
+    std::fs::write(config_dir.join("server.pub"), &ed_pubkey_hex)?;
 
-    std::fs::create_dir_all(&config_dir)?;
+    // Write X25519 private key (keep secret!).
+    std::fs::write(config_dir.join("server_x25519.key"), &x25519_secret_hex)?;
+    // Write X25519 public key.
+    std::fs::write(config_dir.join("server_x25519.pub"), &x25519_pubkey_hex)?;
 
-    let config_path = config_dir.join("server.toml");
-    std::fs::write(&config_path, &config_content)?;
-    println!("Server config written to {:?}", config_path);
+    println!("Server config written to {:?}", config_dir.join("server.toml"));
+    println!("X25519 private key written to {:?} (keep secret!)", config_dir.join("server_x25519.key"));
 
-    let pubkey_path = config_dir.join("server.pub");
-    std::fs::write(&pubkey_path, &pubkey_hex)?;
-    println!("Server public key written to {:?}", pubkey_path);
-
-    // Build connection string JSON.
+    // Build connection string using X25519 pubkey (used for tunnel handshake).
     let conn_json = serde_json::json!({
         "server": ip,
         "port": port,
-        "pubkey": pubkey_hex,
+        "pubkey": x25519_pubkey_hex,
         "version": 1,
     });
-    let conn_json_bytes = conn_json.to_string();
-    let conn_str = URL_SAFE_NO_PAD.encode(conn_json_bytes.as_bytes());
+    let conn_str = URL_SAFE_NO_PAD.encode(conn_json.to_string().as_bytes());
 
     // Generate and print QR code.
     let code = QrCode::new(conn_str.as_bytes())?;
     let image = code.render::<unicode::Dense1x2>().build();
     println!("{}", image);
 
-    // Print raw connection string.
     println!("\nConnection string:\n{}", conn_str);
-    println!("\nScan this QR code in the HVPN tray app, or paste the connection string manually");
+    println!("\nScan this QR code in the HVPN tray app, or paste the connection string manually.");
+    println!("\nIMPORTANT: The connection string contains the X25519 public key used for the tunnel.");
 
     Ok(())
 }
