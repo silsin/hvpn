@@ -453,12 +453,21 @@ async fn handle_authenticated(
         // Assign this client a VPN IP.
         let _client_ip = router.assign_client_ip(peer_addr);
 
-        // Use the shared TUN device.
+        // Use the shared TUN device for reading (server→client direction).
         let shared_tun = match state.shared_tun.as_ref() {
             Some(t) => Arc::clone(t),
             None => {
                 warn!(%peer, "shared TUN not available — falling back to log loop");
-                // fall through to log loop below
+                drop(router);
+                return Ok(());
+            }
+        };
+
+        // Open a second fd to hvpn0 for writing (client→internet direction).
+        let tun_write = match hvpn_tun::LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(%peer, "could not open write TUN fd: {} — falling back to log loop", e);
                 drop(router);
                 return Ok(());
             }
@@ -470,8 +479,8 @@ async fn handle_authenticated(
         let peer_b = peer.clone();
         let router_b = router.clone();
         let client_addr = peer_addr;
-        let tun_a = Arc::clone(&shared_tun);
-        let tun_b = Arc::clone(&shared_tun);
+        let tun_a = Arc::clone(&shared_tun);  // read TUN (server→client)
+        let tun_b = tun_write;                 // write TUN (client→internet)
 
         // Task A: server TUN → client WS
         let tun_to_client = tokio::spawn(async move {
@@ -506,11 +515,12 @@ async fn handle_authenticated(
             }
         });
 
-        // Task B: client WS → server TUN
+        // Task B: client WS → server TUN (internet)
         let client_to_tun = tokio::spawn(async move {
             let codec_b = FrameCodec::new(keys_b.header_key);
             let obfs_b = ObfsEngine::new();
             let mut replay = hvpn_core::ReplayWindow::new();
+            let mut tun_b = tun_b;
             while let Some(msg) = source.next().await {
                 match msg {
                     Ok(Message::Binary(data)) => {
@@ -520,8 +530,7 @@ async fn handle_authenticated(
                                 if replay.check_and_advance(frame.seq).is_err() { continue; }
                                 match hvpn_crypto::decrypt_packet(&keys_b, &frame.payload, frame.seq, None) {
                                     Ok(ip_pkt) => {
-                                        let mut tun = tun_b.lock().await;
-                                        if let Err(e) = tun.write_packet(&ip_pkt).await {
+                                        if let Err(e) = tun_b.write_packet(&ip_pkt).await {
                                             warn!(peer = %peer_b, "TUN write: {}", e);
                                             break;
                                         }
