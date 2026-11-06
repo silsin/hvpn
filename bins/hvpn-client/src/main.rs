@@ -677,83 +677,140 @@ async fn tunnel_loop(
 ) -> Result<()> {
     use hvpn_core::{FrameType, ReplayWindow};
     use hvpn_crypto::decrypt_packet;
+    use rand::{Rng, SeedableRng};
 
-    let mut replay = ReplayWindow::new();
+    let transport = match transport {
+        Some(t) => t.clone(),
+        None => {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            return Ok(());
+        }
+    };
 
-    loop {
-        if let Some(t) = transport {
-            // Run TUN→server and server→TUN concurrently.
-            tokio::select! {
-                // Outbound: TUN packet → encrypt → send to server
-                tun_result = tun.read_packet() => {
-                    match tun_result {
-                        Ok(pkt) if !pkt.is_empty() => {
-                            let ciphertext = encrypt_packet(keys, &pkt, *seq, None)
-                                .context("encrypt failed")?;
-                            let frame = Frame {
-                                seq: *seq,
-                                stream_id: 0,
-                                frame_type: FrameType::Data,
-                                flags: 0,
-                                payload: ciphertext,
-                                padding: vec![],
-                            };
-                            let encoded = codec.encode(&frame);
-                            let padded = obfs.pad_packet(encoded);
-                            let len = padded.len() as u64;
-                            t.send(padded).await.context("send failed")?;
-                            let mut s = state.lock().unwrap();
-                            s.bytes_out = s.bytes_out.wrapping_add(len);
-                            *seq = seq.wrapping_add(1);
-                        }
-                        Ok(_) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        }
-                    }
-                }
-                // Inbound: recv from server → decrypt → write to TUN
-                recv_result = t.recv() => {
-                    match recv_result {
-                        Ok(data) => {
-                            let unpadded = obfs.unpad_packet(data);
-                            match codec.decode(&unpadded) {
-                                Ok(frame) => {
-                                    if frame.frame_type == FrameType::Data {
-                                        if replay.check_and_advance(frame.seq).is_ok() {
-                                            match decrypt_packet(keys, &frame.payload, frame.seq, None) {
-                                                Ok(ip_pkt) => {
-                                                    let len = ip_pkt.len() as u64;
-                                                    tun.write_packet(&ip_pkt).await
-                                                        .context("tun write failed")?;
-                                                    let mut s = state.lock().unwrap();
-                                                    s.bytes_in = s.bytes_in.wrapping_add(len);
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("decrypt failed: {}", e);
-                                                }
-                                            }
-                                        }
+    // Split into two concurrent tasks for full-duplex operation.
+    // This is critical for throughput — select! blocks one direction
+    // while the other is processing, halving effective speed.
+
+    let header_key = keys.header_key;
+    let keys_clone = keys.clone();
+
+    // Channel for inbound packets to be written to TUN.
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+
+    // Clone transport for the download task (uses Arc internally, cheap clone).
+    let transport_rx = transport.clone();
+
+    // Spawn the server→TUN (download) task — runs independently for full duplex.
+    let inbound_state = Arc::clone(&state);
+    let inbound_task = tokio::spawn(async move {
+        let codec_in = FrameCodec::new(header_key);
+        let mut replay = ReplayWindow::new();
+        let mut total_in: u64 = 0;
+
+        loop {
+            match transport_rx.recv().await {
+                Ok(data) => {
+                    // Unpad — read the 2-byte prefix, strip padding.
+                    let unpadded = if data.len() >= 2 {
+                        let pad_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+                        let end = data.len().saturating_sub(pad_len);
+                        if end > 2 { data[2..end].to_vec() } else { continue; }
+                    } else { continue; };
+
+                    match codec_in.decode(&unpadded) {
+                        Ok(frame) => {
+                            if frame.frame_type != FrameType::Data { continue; }
+                            if replay.check_and_advance(frame.seq).is_err() { continue; }
+                            match decrypt_packet(&keys_clone, &frame.payload, frame.seq, None) {
+                                Ok(ip_pkt) => {
+                                    total_in = total_in.wrapping_add(ip_pkt.len() as u64);
+                                    if inbound_tx.send(ip_pkt).await.is_err() { break; }
+                                    // Update state every 100 packets to avoid lock contention.
+                                    if total_in % (100 * 1400) == 0 {
+                                        let mut s = inbound_state.lock().unwrap();
+                                        s.bytes_in = s.bytes_in.wrapping_add(total_in);
+                                        total_in = 0;
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!("frame decode failed: {}", e);
-                                }
+                                Err(_) => continue,
                             }
                         }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("transport recv failed: {}", e));
+                        Err(_) => continue,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("transport recv error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Main TUN→server (upload) loop, interleaved with writing inbound packets.
+    let mut total_out: u64 = 0;
+    let mut rng = rand::rngs::StdRng::from_entropy();
+
+    loop {
+        tokio::select! {
+            // Write inbound packets to TUN when available.
+            Some(ip_pkt) = inbound_rx.recv() => {
+                if let Err(e) = tun.write_packet(&ip_pkt).await {
+                    tracing::warn!("tun write error: {}", e);
+                    break;
+                }
+            }
+            // Read outbound packets from TUN and send to server.
+            tun_result = tun.read_packet() => {
+                match tun_result {
+                    Ok(pkt) if !pkt.is_empty() => {
+                        let ciphertext = encrypt_packet(keys, &pkt, *seq, None)
+                            .context("encrypt failed")?;
+
+                        // Minimal padding: 2-byte header + 0-16 bytes random.
+                        // Full 512-byte padding kills throughput.
+                        let pad_len: u16 = rng.gen_range(0u16..16);
+                        let mut padded = Vec::with_capacity(2 + ciphertext.len() + 4 + pad_len as usize);
+                        let frame = Frame {
+                            seq: *seq,
+                            stream_id: 0,
+                            frame_type: FrameType::Data,
+                            flags: 0,
+                            payload: ciphertext,
+                            padding: vec![],
+                        };
+                        let encoded = codec.encode(&frame);
+                        padded.extend_from_slice(&pad_len.to_le_bytes());
+                        padded.extend_from_slice(&encoded);
+                        let pad: Vec<u8> = (0..pad_len).map(|_| rng.gen::<u8>()).collect();
+                        padded.extend_from_slice(&pad);
+
+                        let len = padded.len() as u64;
+                        if transport.send(padded).await.is_err() { break; }
+                        total_out = total_out.wrapping_add(len);
+                        *seq = seq.wrapping_add(1);
+
+                        // Update state periodically, not every packet.
+                        if *seq % 100 == 0 {
+                            let mut s = state.lock().unwrap();
+                            s.bytes_out = s.bytes_out.wrapping_add(total_out);
+                            total_out = 0;
                         }
+                    }
+                    Ok(_) => {
+                        // Empty packet — small yield to avoid busy loop.
+                        tokio::task::yield_now().await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("tun read error: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     }
                 }
             }
-        } else {
-            // No transport — just drain TUN to avoid blocking.
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
+
+    inbound_task.abort();
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

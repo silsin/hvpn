@@ -144,6 +144,7 @@ type WsStream = tokio_tungstenite::WebSocketStream<
 >;
 
 /// WebSocket transport with realistic browser-like upgrade headers.
+#[derive(Clone)]
 pub struct WebSocketTransport {
     stream: Arc<Mutex<WsStream>>,
     pub domain_front: Option<DomainFrontConfig>,
