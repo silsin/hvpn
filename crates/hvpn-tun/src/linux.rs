@@ -31,6 +31,20 @@ pub struct LinuxTun {
 }
 
 impl LinuxTun {
+    /// Create a `LinuxTun` from an already-open raw file descriptor.
+    /// The fd must already be configured with TUNSETIFF.
+    /// Used by the server to reuse the fd opened by `setup_nat`.
+    pub fn from_raw_fd(fd: RawFd, ifname: &str) -> Result<Self, HvpnError> {
+        use std::os::unix::io::FromRawFd;
+        let std_file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let async_file = File::from_std(std_file);
+        Ok(Self {
+            file: async_file,
+            ifname: ifname.to_string(),
+        })
+    }
+
+impl LinuxTun {
     /// Open and configure a new TUN device.
     ///
     /// - `iface_name` — desired interface name (e.g. `"hvpn0"`); empty means kernel-assigned.

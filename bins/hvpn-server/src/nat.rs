@@ -75,16 +75,10 @@ mod linux_nat {
 
     // ── setup_nat ─────────────────────────────────────────────────────────────
 
-    /// Prepare the server for NAT routing:
-    ///
-    /// 1. Opens `/dev/net/tun`, creates interface `hvpn0`, assigns `tun_ip/24`.
-    /// 2. Enables IP forwarding via `/proc/sys/net/ipv4/ip_forward`.
-    /// 3. Installs an iptables NAT masquerade rule for `10.8.0.0/24`.
-    ///
-    /// Must be called once at server startup, before any connections arrive.
-    pub fn setup_nat(tun_ip: &str) -> Result<(), HvpnError> {
-        // 1. Create hvpn0 TUN interface.
-        open_tun_interface("hvpn0", tun_ip)
+    /// Prepare the server for NAT routing and return the raw TUN fd for reuse.
+    pub fn setup_nat(tun_ip: &str) -> Result<std::os::unix::io::RawFd, HvpnError> {
+        // 1. Create hvpn0 TUN interface and get its fd.
+        let fd = open_tun_interface("hvpn0", tun_ip)
             .map_err(|e| HvpnError::Tun(e.to_string()))?;
 
         // 2. Enable IP forwarding.
@@ -95,27 +89,20 @@ mod linux_nat {
         // 3. NAT masquerade for the VPN subnet.
         run_cmd(
             "iptables",
-            &[
-                "-t", "nat",
-                "-A", "POSTROUTING",
-                "-s", "10.8.0.0/24",
-                "-j", "MASQUERADE",
-            ],
+            &["-t", "nat", "-A", "POSTROUTING", "-s", "10.8.0.0/24", "-j", "MASQUERADE"],
         )?;
         info!("iptables NAT masquerade rule installed (10.8.0.0/24)");
 
-        Ok(())
+        Ok(fd)
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /// Open `/dev/net/tun`, configure it as `iface_name`, assign `tun_ip/24`,
-    /// and bring the interface up.  The file descriptor is intentionally leaked
-    /// so the kernel keeps the interface alive for the process lifetime; the
-    /// async forwarding tasks re-open `/dev/net/tun` independently for I/O.
-    fn open_tun_interface(iface_name: &str, tun_ip: &str) -> Result<(), String> {
+    /// bring the interface up, and return the raw file descriptor for reuse.
+    fn open_tun_interface(iface_name: &str, tun_ip: &str) -> Result<std::os::unix::io::RawFd, String> {
         use std::fs::OpenOptions;
-        use std::os::unix::io::AsRawFd;
+        use std::os::unix::io::IntoRawFd;
 
         let file = OpenOptions::new()
             .read(true)
@@ -125,7 +112,6 @@ mod linux_nat {
 
         let raw_fd = file.as_raw_fd();
 
-        // TUNSETIFF ioctl constants.
         const TUNSETIFF: u64 = 0x400454CA;
         const IFF_TUN: i16 = 0x0001;
         const IFF_NO_PI: i16 = 0x1000;
@@ -152,7 +138,6 @@ mod linux_nat {
             return Err(format!("TUNSETIFF ioctl failed (errno {})", errno));
         }
 
-        // Assign CIDR address (add /24 if not already present).
         let cidr = if tun_ip.contains('/') {
             tun_ip.to_string()
         } else {
@@ -163,11 +148,10 @@ mod linux_nat {
         run_cmd("ip", &["link", "set", iface_name, "up"])
             .map_err(|e| e.to_string())?;
 
-        // Leak the fd intentionally so the interface persists.
-        std::mem::forget(file);
-
         info!(iface = iface_name, ip = tun_ip, "TUN interface configured");
-        Ok(())
+
+        // Return the fd — caller owns it now.
+        Ok(file.into_raw_fd())
     }
 
     /// Run an external command; return an error if it exits non-zero.

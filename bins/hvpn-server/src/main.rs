@@ -120,32 +120,27 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ── NAT routing setup (Linux only) ────────────────────────────────────
+    // ── NAT routing setup + shared TUN (Linux only) ──────────────────────
     #[cfg(target_os = "linux")]
-    let nat_router: Option<Arc<nat::NatRouter>> = if cfg.nat_enabled {
-        nat::setup_nat("10.8.0.1")
-            .with_context(|| "NAT setup failed")?;
-        info!("NAT routing enabled");
-        Some(Arc::new(nat::NatRouter::new()))
-    } else {
-        None
-    };
-
-    // ── Open shared TUN device once (Linux only) ───────────────────────────
-    #[cfg(target_os = "linux")]
-    let shared_tun: Option<Arc<tokio::sync::Mutex<hvpn_tun::LinuxTun>>> = if cfg.nat_enabled {
-        match hvpn_tun::LinuxTun::open("hvpn0", "10.8.0.1/24", "0.0.0.0").await {
-            Ok(tun) => {
-                info!("shared TUN device opened for NAT forwarding");
-                Some(Arc::new(tokio::sync::Mutex::new(tun)))
+    let (nat_router, shared_tun) = if cfg.nat_enabled {
+        match nat::setup_nat("10.8.0.1") {
+            Ok(tun_fd) => {
+                info!("NAT routing enabled");
+                let tun = hvpn_tun::LinuxTun::from_raw_fd(tun_fd, "hvpn0")
+                    .expect("failed to wrap TUN fd");
+                info!("shared TUN device ready for NAT forwarding");
+                (
+                    Some(Arc::new(nat::NatRouter::new())),
+                    Some(Arc::new(tokio::sync::Mutex::new(tun))),
+                )
             }
             Err(e) => {
-                warn!("could not open shared TUN device: {} — NAT forwarding disabled", e);
-                None
+                warn!("NAT setup failed: {} — NAT disabled", e);
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     // Nonce / replay cache: maps 32-byte token → UNIX timestamp of first use.
