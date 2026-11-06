@@ -5,11 +5,12 @@ use futures_util::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
 
 use hvpn_common::{AuditEvent, AuditLogger, Config};
 use hvpn_core::FrameCodec;
-use hvpn_crypto::{generate_probe_token, perform_handshake_server, decrypt_packet};
+use hvpn_crypto::{generate_probe_token, perform_handshake_server, decrypt_packet, RatchetState};
 use hvpn_obfs::ObfsEngine;
 
 mod nat;
@@ -52,13 +53,99 @@ Connection: close\r\n\
 struct ServerState {
     server_secret: [u8; 32],
     mac_key: [u8; 32],
-    nonce_cache: Arc<DashMap<[u8; 32], u64>>,
+    /// Optional auth secret loaded from `/etc/hvpn/server.auth`.
+    /// When `None`, the server logs a warning and rejects all tokens.
+    auth_secret: Option<[u8; 32]>,
+    /// Replay cache: maps 40-byte token → UNIX timestamp of first use.
+    nonce_cache: Arc<DashMap<[u8; 40], u64>>,
     /// Present only on Linux when `config.nat_enabled = true`.
     #[cfg(target_os = "linux")]
     nat_router: Option<Arc<nat::NatRouter>>,
     /// Shared TUN device for NAT forwarding (Linux only).
     #[cfg(target_os = "linux")]
     shared_tun: Option<Arc<tokio::sync::Mutex<hvpn_tun::LinuxTun>>>,
+}
+
+// ── TLS cert helpers ──────────────────────────────────────────────────────────
+
+/// Ensure `/etc/hvpn/server.pem` and `/etc/hvpn/server.key` exist.
+/// If they are missing, generate a self-signed ECDSA cert using rcgen and save them.
+/// Returns `(cert_pem, key_pem)` on success.
+fn ensure_tls_cert(cert_path: &str, key_path: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let cert_exists = std::path::Path::new(cert_path).exists();
+    let key_exists = std::path::Path::new(key_path).exists();
+
+    if cert_exists && key_exists {
+        let cert_pem = std::fs::read(cert_path)
+            .with_context(|| format!("reading {}", cert_path))?;
+        let key_pem = std::fs::read(key_path)
+            .with_context(|| format!("reading {}", key_path))?;
+        info!("TLS cert loaded from {} / {}", cert_path, key_path);
+        return Ok((cert_pem, key_pem));
+    }
+
+    // Generate self-signed cert with ECDSA P-256 (equivalent security to RSA 2048+).
+    info!("Generating self-signed TLS certificate (ECDSA P-256)");
+    let key_pair = rcgen::KeyPair::generate()
+        .context("rcgen: failed to generate key pair")?;
+    let mut params = rcgen::CertificateParams::new(
+        vec!["localhost".to_string(), "hvpn-server".to_string()]
+    ).context("rcgen: failed to create cert params")?;
+    let cert = params.self_signed(&key_pair)
+        .context("rcgen: failed to self-sign certificate")?;
+
+    let cert_pem = cert.pem().into_bytes();
+    let key_pem = key_pair.serialize_pem().into_bytes();
+
+    // Create parent directory if needed.
+    if let Some(parent) = std::path::Path::new(cert_path).parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+
+    std::fs::write(cert_path, &cert_pem)
+        .with_context(|| format!("writing {}", cert_path))?;
+    std::fs::write(key_path, &key_pem)
+        .with_context(|| format!("writing {}", key_path))?;
+
+    info!("Self-signed TLS cert saved to {} / {}", cert_path, key_path);
+    Ok((cert_pem, key_pem))
+}
+
+/// Build a `rustls::ServerConfig` from PEM cert and key bytes.
+fn build_rustls_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<rustls::ServerConfig>> {
+    use rustls::pki_types::PrivateKeyDer;
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = {
+        let mut cursor = std::io::Cursor::new(cert_pem);
+        rustls_pemfile::certs(&mut cursor)
+            .collect::<std::result::Result<_, _>>()
+            .context("parsing TLS cert PEM")?
+    };
+
+    let key = {
+        let mut cursor = std::io::Cursor::new(key_pem);
+        rustls_pemfile::private_key(&mut cursor)
+            .context("parsing TLS key PEM")?
+            .context("no private key found in PEM")?
+    };
+
+    // Convert to the owned variant required by ServerConfig.
+    let key_owned: PrivateKeyDer<'static> = match key {
+        PrivateKeyDer::Pkcs1(k) => PrivateKeyDer::Pkcs1(k.clone_key()),
+        PrivateKeyDer::Pkcs8(k) => PrivateKeyDer::Pkcs8(k.clone_key()),
+        PrivateKeyDer::Sec1(k) => PrivateKeyDer::Sec1(k.clone_key()),
+        other => other,
+    };
+
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key_owned)
+        .context("building rustls ServerConfig")?;
+
+    Ok(Arc::new(server_cfg))
 }
 
 #[tokio::main]
@@ -120,6 +207,62 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Load auth secret from /etc/hvpn/server.auth (generated in --setup, Step 4).
+    // If the file doesn't exist, warn and operate without auth (reject all tokens).
+    #[cfg(target_os = "windows")]
+    let auth_secret_path = r"C:\ProgramData\hvpn\server.auth";
+    #[cfg(not(target_os = "windows"))]
+    let auth_secret_path = "/etc/hvpn/server.auth";
+
+    let auth_secret: Option<[u8; 32]> = std::fs::read_to_string(auth_secret_path)
+        .ok()
+        .and_then(|s| {
+            let hex = s.trim();
+            if hex.len() == 64 {
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i+2], 16).ok())
+                    .collect();
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(arr)
+                } else { None }
+            } else { None }
+        });
+
+    if auth_secret.is_none() {
+        warn!("auth secret not found at {} — auth token validation disabled (run '--setup' to generate)", auth_secret_path);
+    } else {
+        info!("auth secret loaded from {}", auth_secret_path);
+    }
+
+    // ── TLS setup ─────────────────────────────────────────────────────────
+    #[cfg(target_os = "windows")]
+    let (tls_cert_path, tls_key_path) = (r"C:\ProgramData\hvpn\server.pem", r"C:\ProgramData\hvpn\server.key");
+    #[cfg(not(target_os = "windows"))]
+    let (tls_cert_path, tls_key_path) = ("/etc/hvpn/server.pem", "/etc/hvpn/server.key");
+
+    let tls_acceptor: Option<tokio_rustls::TlsAcceptor> =
+        match ensure_tls_cert(tls_cert_path, tls_key_path) {
+            Ok((cert_pem, key_pem)) => {
+                match build_rustls_server_config(&cert_pem, &key_pem) {
+                    Ok(server_cfg) => {
+                        info!("TLS enabled — connections will use wss://");
+                        Some(tokio_rustls::TlsAcceptor::from(server_cfg))
+                    }
+                    Err(e) => {
+                        warn!("TLS config build failed: {} — falling back to plain WebSocket", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("TLS cert unavailable: {} — falling back to plain WebSocket", e);
+                None
+            }
+        };
+
     // ── NAT routing setup + shared TUN (Linux only) ──────────────────────
     #[cfg(target_os = "linux")]
     let (nat_router, shared_tun) = if cfg.nat_enabled {
@@ -143,12 +286,13 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
-    // Nonce / replay cache: maps 32-byte token → UNIX timestamp of first use.
-    let nonce_cache: Arc<DashMap<[u8; 32], u64>> = Arc::new(DashMap::new());
+    // Nonce / replay cache: maps 40-byte token → UNIX timestamp of first use.
+    let nonce_cache: Arc<DashMap<[u8; 40], u64>> = Arc::new(DashMap::new());
 
     let state = Arc::new(ServerState {
         server_secret: server_secret_bytes,
         mac_key,
+        auth_secret,
         nonce_cache,
         #[cfg(target_os = "linux")]
         nat_router,
@@ -212,6 +356,7 @@ async fn main() -> Result<()> {
     }
 
     let require_knock = std::env::var("HVPN_REQUIRE_KNOCK").is_ok();
+    let tls_acceptor = Arc::new(tls_acceptor);
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -229,6 +374,7 @@ async fn main() -> Result<()> {
 
         let state_clone = state.clone();
         let audit_clone = audit.clone();
+        let tls_clone = tls_acceptor.clone();
 
         audit_clone.log(AuditEvent::ClientConnected {
             peer_ip: peer_addr.ip().to_string(),
@@ -236,97 +382,192 @@ async fn main() -> Result<()> {
         });
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, state_clone, audit_clone).await {
+            let result = if let Some(ref acceptor) = *tls_clone {
+                handle_connection_tls(stream, peer_addr, state_clone, audit_clone, acceptor.clone()).await
+            } else {
+                handle_connection_plain(stream, peer_addr, state_clone, audit_clone).await
+            };
+            if let Err(e) = result {
                 warn!(%peer_addr, error = %e, "connection error");
             }
         });
     }
 }
 
-fn run_setup() -> anyhow::Result<()> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use hvpn_crypto::KeyPair;
-    use qrcode::QrCode;
-    use qrcode::render::unicode;
-    use x25519_dalek::{StaticSecret, PublicKey};
-    use rand::rngs::OsRng;
+// ── Auth token validation ─────────────────────────────────────────────────────
 
-    // Generate fresh Ed25519 server keypair (for identity).
-    let kp = KeyPair::generate();
-    let ed_pubkey_bytes = kp.public_key_bytes();
-    let ed_pubkey_hex: String = ed_pubkey_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+/// Validate the `X-Auth-Token` header from a WebSocket upgrade request.
+///
+/// Token format: 40 bytes hex-encoded (80 chars).
+///   - bytes[0..8]  = LE timestamp (unix seconds)
+///   - bytes[8..40] = HMAC-SHA256(auth_secret, timestamp_le || [0u8;16])
+///
+/// Returns `Ok([u8; 40])` with the raw token bytes on success (for replay cache).
+/// Returns `Err(reason)` if auth is disabled, token is missing, malformed, or invalid.
+fn validate_auth_token(
+    req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    auth_secret: Option<[u8; 32]>,
+) -> Result<[u8; 40], String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
-    // Generate fresh X25519 keypair (for tunnel handshake).
-    let x25519_secret = StaticSecret::random_from_rng(OsRng);
-    let x25519_public = PublicKey::from(&x25519_secret);
-    let x25519_secret_hex: String = x25519_secret.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
-    let x25519_pubkey_hex: String = x25519_public.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+    let secret = match auth_secret {
+        Some(s) => s,
+        None => return Err("no auth secret configured — rejecting all tokens".to_string()),
+    };
 
-    // Detect public IP.
-    let ip = reqwest::blocking::get("https://api.ipify.org")?.text()?;
-    let ip = ip.trim().to_string();
+    // Extract header.
+    let token_hex = match req.headers().get("x-auth-token") {
+        Some(v) => v.to_str().unwrap_or(""),
+        None => return Err("missing X-Auth-Token header".to_string()),
+    };
 
-    let port: u16 = 443;
+    if token_hex.len() != 80 {
+        return Err(format!("X-Auth-Token wrong length: {} (expected 80 hex chars)", token_hex.len()));
+    }
 
-    #[cfg(target_os = "windows")]
-    let config_dir = std::path::PathBuf::from(r"C:\ProgramData\hvpn");
-    #[cfg(not(target_os = "windows"))]
-    let config_dir = std::path::PathBuf::from("/etc/hvpn");
+    // Hex-decode.
+    let token_bytes: Vec<u8> = (0..token_hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(token_hex.get(i..i+2)?, 16).ok())
+        .collect();
+    if token_bytes.len() != 40 {
+        return Err("X-Auth-Token hex decode failed".to_string());
+    }
 
-    std::fs::create_dir_all(&config_dir)?;
+    let mut token_arr = [0u8; 40];
+    token_arr.copy_from_slice(&token_bytes);
 
-    // Write server config.
-    #[cfg(target_os = "windows")]
-    let tls_cert_path = r"C:\ProgramData\hvpn\server.pem";
-    #[cfg(not(target_os = "windows"))]
-    let tls_cert_path = "/etc/hvpn/server.pem";
+    // Extract timestamp.
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&token_arr[0..8]);
+    let token_ts = u64::from_le_bytes(ts_bytes);
+    let server_ts = current_timestamp_secs();
 
-    let config_content = format!(
-        r#"server_address = "{ip}"
-server_port = {port}
-tls_cert_path = "{tls_cert}"
-nat_enabled = true
-dns_servers = ["1.1.1.1", "8.8.8.8"]
-tun_ip = "10.8.0.1"
-tun_netmask = "255.255.255.0"
-"#,
-        ip = ip, port = port, tls_cert = tls_cert_path,
-    );
-    std::fs::write(config_dir.join("server.toml"), &config_content)?;
+    // Allow ±30 seconds of clock skew.
+    let diff = if server_ts >= token_ts {
+        server_ts - token_ts
+    } else {
+        token_ts - server_ts
+    };
+    if diff > 30 {
+        return Err(format!("X-Auth-Token timestamp out of range (diff={}s)", diff));
+    }
 
-    // Write Ed25519 public key.
-    std::fs::write(config_dir.join("server.pub"), &ed_pubkey_hex)?;
+    // Recompute expected HMAC and verify in constant time via hmac::Mac::verify_slice,
+    // which uses subtle internally — avoids timing oracle on partial prefix matches.
+    let mut mac_input = [0u8; 24];
+    mac_input[..8].copy_from_slice(&ts_bytes);
+    // bytes [8..24] stay zero (fixed nonce).
 
-    // Write X25519 private key (keep secret!).
-    std::fs::write(config_dir.join("server_x25519.key"), &x25519_secret_hex)?;
-    // Write X25519 public key.
-    std::fs::write(config_dir.join("server_x25519.pub"), &x25519_pubkey_hex)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret)
+        .expect("HMAC accepts any key length");
+    mac.update(&mac_input);
+    let received = &token_arr[8..40];
+    if mac.verify_slice(received).is_err() {
+        return Err("X-Auth-Token HMAC mismatch".to_string());
+    }
 
-    println!("Server config written to {:?}", config_dir.join("server.toml"));
-    println!("X25519 private key written to {:?} (keep secret!)", config_dir.join("server_x25519.key"));
-
-    // Build connection string using X25519 pubkey (used for tunnel handshake).
-    let conn_json = serde_json::json!({
-        "server": ip,
-        "port": port,
-        "pubkey": x25519_pubkey_hex,
-        "version": 1,
-    });
-    let conn_str = URL_SAFE_NO_PAD.encode(conn_json.to_string().as_bytes());
-
-    // Generate and print QR code.
-    let code = QrCode::new(conn_str.as_bytes())?;
-    let image = code.render::<unicode::Dense1x2>().build();
-    println!("{}", image);
-
-    println!("\nConnection string:\n{}", conn_str);
-    println!("\nScan this QR code in the HVPN tray app, or paste the connection string manually.");
-    println!("\nIMPORTANT: The connection string contains the X25519 public key used for the tunnel.");
-
-    Ok(())
+    Ok(token_arr)
 }
 
-async fn handle_connection(
+// ── TLS connection path ───────────────────────────────────────────────────────
+
+async fn handle_connection_tls(
+    stream: tokio::net::TcpStream,
+    peer_addr: std::net::SocketAddr,
+    state: Arc<ServerState>,
+    audit: Arc<AuditLogger>,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> Result<()> {
+    let peer = peer_addr.to_string();
+
+    // Perform TLS handshake.
+    let tls_stream = match acceptor.accept(stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%peer, "TLS handshake failed: {}", e);
+            audit.log(AuditEvent::HandshakeFailed {
+                peer_ip: peer_addr.ip().to_string(),
+                reason: format!("TLS: {}", e),
+                timestamp: AuditLogger::current_timestamp(),
+            });
+            return Ok(());
+        }
+    };
+
+    // WebSocket upgrade with HMAC token auth.
+    let auth_secret_opt = state.auth_secret;
+    let validated_token: Arc<std::sync::Mutex<Option<[u8; 40]>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let vt_clone = validated_token.clone();
+
+    #[allow(clippy::result_large_err)]
+    let ws_result = tokio_tungstenite::accept_hdr_async(
+        tls_stream,
+        move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+              mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            match validate_auth_token(req, auth_secret_opt) {
+                Ok(token_arr) => {
+                    let mut guard = vt_clone.lock().unwrap();
+                    *guard = Some(token_arr);
+                    Ok(resp)
+                }
+                Err(reason) => {
+                    warn!("auth token rejected: {}", reason);
+                    let mut err_resp = http::Response::new(Some(reason));
+                    *err_resp.status_mut() = http::StatusCode::FORBIDDEN;
+                    Err(err_resp)
+                }
+            }
+        },
+    )
+    .await;
+
+    match ws_result {
+        Ok(ws_stream) => {
+            // Check if auth succeeded (validated_token must be Some).
+            let token_arr = {
+                let guard = validated_token.lock().unwrap();
+                *guard
+            };
+            let token_arr = match token_arr {
+                Some(t) => t,
+                None => {
+                    warn!(%peer, "connection closed: auth token missing or invalid");
+                    let (mut sink, _) = ws_stream.split();
+                    let _ = sink.close().await;
+                    return Ok(());
+                }
+            };
+            // Replay check.
+            let now = current_timestamp_secs();
+            state.nonce_cache.retain(|_, &mut stored_ts| now.saturating_sub(stored_ts) <= 60);
+            if state.nonce_cache.contains_key(&token_arr) {
+                warn!(%peer, "replay token detected — closing connection");
+                let (mut sink, _) = ws_stream.split();
+                let _ = sink.close().await;
+                return Ok(());
+            }
+            state.nonce_cache.insert(token_arr, now);
+
+            handle_authenticated(ws_stream, peer, peer_addr, state, audit).await
+        }
+        Err(e) => {
+            warn!(%peer, "WS upgrade failed: {}", e);
+            audit.log(AuditEvent::HandshakeFailed {
+                peer_ip: peer_addr.ip().to_string(),
+                reason: e.to_string(),
+                timestamp: AuditLogger::current_timestamp(),
+            });
+            Ok(())
+        }
+    }
+}
+
+// ── Plain WebSocket connection path (fallback when TLS unavailable) ───────────
+
+async fn handle_connection_plain(
     stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
     state: Arc<ServerState>,
@@ -350,50 +591,60 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // ── WebSocket handshake with sync auth check ───────────────────────────
-    let validated_token: Arc<std::sync::Mutex<Option<[u8; 32]>>> =
+    // ── WebSocket handshake with HMAC token auth ──────────────────────────
+    let auth_secret_opt = state.auth_secret;
+    let validated_token: Arc<std::sync::Mutex<Option<[u8; 40]>>> =
         Arc::new(std::sync::Mutex::new(None));
     let vt_clone = validated_token.clone();
-    let mac_key = state.mac_key;
 
     #[allow(clippy::result_large_err)]
     let ws_stream_result = tokio_tungstenite::accept_hdr_async(
         stream,
         move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
               mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            // Auth check disabled for development — all connections accepted.
-            // TODO: re-enable once client sends correct HMAC token.
-            let token_valid = true;
-            let _req = req;
-
-            if !token_valid {
-                *resp.status_mut() = http::StatusCode::FORBIDDEN;
+            match validate_auth_token(req, auth_secret_opt) {
+                Ok(token_arr) => {
+                    let mut guard = vt_clone.lock().unwrap();
+                    *guard = Some(token_arr);
+                    Ok(resp)
+                }
+                Err(reason) => {
+                    warn!("auth token rejected: {}", reason);
+                    let mut err_resp = http::Response::new(Some(reason));
+                    *err_resp.status_mut() = http::StatusCode::FORBIDDEN;
+                    Err(err_resp)
+                }
             }
-            Ok(resp)
         },
     )
     .await;
 
     match ws_stream_result {
         Ok(ws_stream) => {
-            // Async replay-cache check.
+            // Check if auth succeeded (validated_token must be Some).
             let token_arr = {
                 let guard = validated_token.lock().unwrap();
                 *guard
             };
-            if let Some(token_arr) = token_arr {
-                let now = current_timestamp_secs();
-                state
-                    .nonce_cache
-                    .retain(|_, &mut stored_ts| now.saturating_sub(stored_ts) <= 60);
-                if state.nonce_cache.contains_key(&token_arr) {
-                    warn!(%peer, "replay token detected — closing connection");
+            let token_arr = match token_arr {
+                Some(t) => t,
+                None => {
+                    warn!(%peer, "connection closed: auth token missing or invalid");
                     let (mut sink, _) = ws_stream.split();
                     let _ = sink.close().await;
                     return Ok(());
                 }
-                state.nonce_cache.insert(token_arr, now);
+            };
+            // Replay check.
+            let now = current_timestamp_secs();
+            state.nonce_cache.retain(|_, &mut stored_ts| now.saturating_sub(stored_ts) <= 60);
+            if state.nonce_cache.contains_key(&token_arr) {
+                warn!(%peer, "replay token detected — closing connection");
+                let (mut sink, _) = ws_stream.split();
+                let _ = sink.close().await;
+                return Ok(());
             }
+            state.nonce_cache.insert(token_arr, now);
 
             handle_authenticated(ws_stream, peer, peer_addr, state, audit).await
         }
@@ -409,14 +660,19 @@ async fn handle_connection(
     }
 }
 
+// ── Shared authenticated session handler ─────────────────────────────────────
+
 #[allow(unused_variables)]
-async fn handle_authenticated(
-    ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+async fn handle_authenticated<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
     peer: String,
     peer_addr: std::net::SocketAddr,
     state: Arc<ServerState>,
     audit: Arc<AuditLogger>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     use tokio_tungstenite::tungstenite::protocol::Message;
 
     info!(%peer, "authenticated connection established");
@@ -438,6 +694,13 @@ async fn handle_authenticated(
     };
 
     info!(%peer, "crypto handshake complete");
+
+    // Initialise the double ratchet for this session (server role).
+    // Split into independent send/recv halves guarded by separate Mutexes so
+    // both directions can advance concurrently without blocking.
+    let ratchet = RatchetState::init_server(&session_keys);
+    let ratchet_send = std::sync::Arc::new(std::sync::Mutex::new(ratchet.send));
+    let ratchet_recv = std::sync::Arc::new(std::sync::Mutex::new(ratchet.recv));
 
     // Save the header key so we can build fresh FrameCodec instances per task.
     let header_key = session_keys.header_key;
@@ -464,14 +727,12 @@ async fn handle_authenticated(
         };
 
         // Duplicate the TUN fd for writing (client→internet direction).
-        // dup() creates a new fd pointing to the same kernel interface,
-        // avoiding EBUSY from trying to TUNSETIFF an already-bound interface.
         let tun_write = {
             let tun = shared_tun.lock().await;
             match tun.try_clone() {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!(%peer, "could not dup TUN fd: {} — falling back to log loop", e);
+                    warn!(%peer, "could not open write TUN fd: {} — falling back to log loop", e);
                     drop(router);
                     return Ok(());
                 }
@@ -487,7 +748,11 @@ async fn handle_authenticated(
         let tun_a = Arc::clone(&shared_tun);  // read TUN (server→client)
         let tun_b = tun_write;                 // write TUN (client→internet)
 
-        // Task A: server TUN → client WS
+        // Clone ratchet halves for each task.
+        let ratchet_send_a = std::sync::Arc::clone(&ratchet_send);
+        let ratchet_recv_b = std::sync::Arc::clone(&ratchet_recv);
+
+        // Task A: server TUN → client WS (server send direction)
         let tun_to_client = tokio::spawn(async move {
             let codec_a = FrameCodec::new(keys_a.header_key);
             let mut obfs_a = ObfsEngine::new();
@@ -500,7 +765,15 @@ async fn handle_authenticated(
                         Err(e) => { warn!(peer = %peer_a, "TUN read: {}", e); break; }
                     }
                 };
-                match hvpn_crypto::encrypt_packet(&keys_a, &ip_pkt, out_seq, None) {
+                // Derive the per-packet encryption key from the send ratchet.
+                let msg_key = ratchet_send_a.lock().unwrap().next_key();
+                let ratchet_session = hvpn_crypto::SessionKeys {
+                    send_key: msg_key,
+                    recv_key: [0u8; 32],
+                    header_key: keys_a.header_key,
+                    mac_key: keys_a.mac_key,
+                };
+                match hvpn_crypto::encrypt_packet(&ratchet_session, &ip_pkt, out_seq, None) {
                     Ok(ciphertext) => {
                         let frame = Frame {
                             seq: out_seq,
@@ -520,7 +793,7 @@ async fn handle_authenticated(
             }
         });
 
-        // Task B: client WS → server TUN (internet)
+        // Task B: client WS → server TUN (internet) (server recv direction)
         let client_to_tun = tokio::spawn(async move {
             let codec_b = FrameCodec::new(keys_b.header_key);
             let obfs_b = ObfsEngine::new();
@@ -533,7 +806,15 @@ async fn handle_authenticated(
                         match codec_b.decode(&unpadded) {
                             Ok(frame) => {
                                 if replay.check_and_advance(frame.seq).is_err() { continue; }
-                                match hvpn_crypto::decrypt_packet(&keys_b, &frame.payload, frame.seq, None) {
+                                // Derive the per-packet decryption key from the recv ratchet.
+                                let msg_key = ratchet_recv_b.lock().unwrap().next_key();
+                                let ratchet_session = hvpn_crypto::SessionKeys {
+                                    send_key: [0u8; 32],
+                                    recv_key: msg_key,
+                                    header_key: keys_b.header_key,
+                                    mac_key: keys_b.mac_key,
+                                };
+                                match hvpn_crypto::decrypt_packet(&ratchet_session, &frame.payload, frame.seq, None) {
                                     Ok(ip_pkt) => {
                                         if let Err(e) = tun_b.write_packet(&ip_pkt).await {
                                             warn!(peer = %peer_b, "TUN write: {}", e);
@@ -582,7 +863,15 @@ async fn handle_authenticated(
                             warn!(%peer, "replay: {}", e);
                             continue;
                         }
-                        match decrypt_packet(&session_keys, &frame.payload, frame.seq, None) {
+                        // Derive the per-packet decryption key from the recv ratchet.
+                        let msg_key = ratchet_recv.lock().unwrap().next_key();
+                        let ratchet_session = hvpn_crypto::SessionKeys {
+                            send_key: [0u8; 32],
+                            recv_key: msg_key,
+                            header_key: session_keys.header_key,
+                            mac_key: session_keys.mac_key,
+                        };
+                        match decrypt_packet(&ratchet_session, &frame.payload, frame.seq, None) {
                             Ok(plaintext) => {
                                 info!(
                                     %peer,
@@ -620,6 +909,100 @@ async fn handle_authenticated(
     Ok(())
 }
 
+fn run_setup() -> anyhow::Result<()> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use hvpn_crypto::KeyPair;
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+    use rand::RngCore;
+    use x25519_dalek::{StaticSecret, PublicKey};
+    use rand::rngs::OsRng;
+
+    // Generate fresh Ed25519 server keypair (for identity).
+    let kp = KeyPair::generate();
+    let ed_pubkey_bytes = kp.public_key_bytes();
+    let ed_pubkey_hex: String = ed_pubkey_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Generate fresh X25519 keypair (for tunnel handshake).
+    let x25519_secret = StaticSecret::random_from_rng(OsRng);
+    let x25519_public = PublicKey::from(&x25519_secret);
+    let x25519_secret_hex: String = x25519_secret.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+    let x25519_pubkey_hex: String = x25519_public.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Generate random 32-byte auth secret.
+    let mut auth_secret_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut auth_secret_bytes);
+    let auth_secret_hex: String = auth_secret_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Detect public IP.
+    let ip = reqwest::blocking::get("https://api.ipify.org")?.text()?;
+    let ip = ip.trim().to_string();
+
+    let port: u16 = 443;
+
+    #[cfg(target_os = "windows")]
+    let config_dir = std::path::PathBuf::from(r"C:\ProgramData\hvpn");
+    #[cfg(not(target_os = "windows"))]
+    let config_dir = std::path::PathBuf::from("/etc/hvpn");
+
+    std::fs::create_dir_all(&config_dir)?;
+
+    // Write server config.
+    #[cfg(target_os = "windows")]
+    let tls_cert_path = r"C:\ProgramData\hvpn\server.pem";
+    #[cfg(not(target_os = "windows"))]
+    let tls_cert_path = "/etc/hvpn/server.pem";
+
+    let config_content = format!(
+        r#"server_address = "{ip}"
+server_port = {port}
+tls_cert_path = "{tls_cert}"
+nat_enabled = true
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+tun_ip = "10.8.0.1"
+tun_netmask = "255.255.255.0"
+"#,
+        ip = ip, port = port, tls_cert = tls_cert_path,
+    );
+    std::fs::write(config_dir.join("server.toml"), &config_content)?;
+
+    // Write Ed25519 public key.
+    std::fs::write(config_dir.join("server.pub"), &ed_pubkey_hex)?;
+
+    // Write X25519 private key (keep secret!).
+    std::fs::write(config_dir.join("server_x25519.key"), &x25519_secret_hex)?;
+    // Write X25519 public key.
+    std::fs::write(config_dir.join("server_x25519.pub"), &x25519_pubkey_hex)?;
+
+    // Write auth secret (keep secret — shared with clients via connection string).
+    std::fs::write(config_dir.join("server.auth"), &auth_secret_hex)?;
+
+    println!("Server config written to {:?}", config_dir.join("server.toml"));
+    println!("X25519 private key written to {:?} (keep secret!)", config_dir.join("server_x25519.key"));
+    println!("Auth secret written to {:?} (keep secret!)", config_dir.join("server.auth"));
+
+    // Build connection string using X25519 pubkey + auth_secret.
+    let conn_json = serde_json::json!({
+        "server": ip,
+        "port": port,
+        "pubkey": x25519_pubkey_hex,
+        "version": 1,
+        "auth_secret": auth_secret_hex,
+    });
+    let conn_str = URL_SAFE_NO_PAD.encode(conn_json.to_string().as_bytes());
+
+    // Generate and print QR code.
+    let code = QrCode::new(conn_str.as_bytes())?;
+    let image = code.render::<unicode::Dense1x2>().build();
+    println!("{}", image);
+
+    println!("\nConnection string:\n{}", conn_str);
+    println!("\nScan this QR code in the HVPN tray app, or paste the connection string manually.");
+    println!("\nIMPORTANT: The connection string contains the X25519 public key and auth secret.");
+
+    Ok(())
+}
+
 fn hex_decode(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
@@ -640,8 +1023,8 @@ mod tests {
 
     #[test]
     fn probe_token_replay_rejection() {
-        let cache: DashMap<[u8; 32], u64> = DashMap::new();
-        let token: [u8; 32] = [0xAB; 32];
+        let cache: DashMap<[u8; 40], u64> = DashMap::new();
+        let token: [u8; 40] = [0xAB; 40];
         let ts: u64 = 1_700_000_000;
 
         // First insertion should succeed (key was absent).
@@ -652,4 +1035,186 @@ mod tests {
         let is_replay = cache.contains_key(&token);
         assert!(is_replay, "second token should be detected as replay");
     }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Mint a valid 40-byte auth token given a secret and a timestamp (unix secs).
+    /// Matches exactly the logic in `validate_auth_token`.
+    fn mint_token(auth_secret: &[u8; 32], ts: u64) -> [u8; 40] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let ts_le = ts.to_le_bytes();
+        let mut mac_input = [0u8; 24];
+        mac_input[..8].copy_from_slice(&ts_le);
+        // bytes [8..24] are zero (fixed nonce).
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(auth_secret)
+            .expect("HMAC accepts any key length");
+        mac.update(&mac_input);
+        let hmac_bytes: [u8; 32] = mac.finalize().into_bytes().into();
+
+        let mut token = [0u8; 40];
+        token[..8].copy_from_slice(&ts_le);
+        token[8..].copy_from_slice(&hmac_bytes);
+        token
+    }
+
+    /// Build an `http::Request<()>` with the given `X-Auth-Token` header value.
+    fn make_ws_request_with_token(token_hex: &str) -> tokio_tungstenite::tungstenite::handshake::server::Request {
+        http::Request::builder()
+            .uri("ws://localhost/ws")
+            .header("X-Auth-Token", token_hex)
+            .body(())
+            .expect("build request")
+    }
+
+    /// Build an `http::Request<()>` with no `X-Auth-Token` header.
+    fn make_ws_request_no_token() -> tokio_tungstenite::tungstenite::handshake::server::Request {
+        http::Request::builder()
+            .uri("ws://localhost/ws")
+            .body(())
+            .expect("build request")
+    }
+
+    // ── test_auth_token_validation ────────────────────────────────────────────
+
+    /// A freshly minted token validates, a tampered token is rejected, an
+    /// expired token is rejected, and a replayed token is detected by the
+    /// `DashMap`-based nonce cache.
+    #[test]
+    fn test_auth_token_validation() {
+        use dashmap::DashMap;
+        use super::{validate_auth_token, current_timestamp_secs};
+
+        let auth_secret: [u8; 32] = [0x42u8; 32];
+
+        // 1. Fresh token (current timestamp) — must validate.
+        let ts_now = current_timestamp_secs();
+        let token = mint_token(&auth_secret, ts_now);
+        let token_hex: String = token.iter().map(|b| format!("{:02x}", b)).collect();
+        let req = make_ws_request_with_token(&token_hex);
+        let result = validate_auth_token(&req, Some(auth_secret));
+        assert!(result.is_ok(), "fresh token should be accepted: {:?}", result);
+
+        // 2. Token with timestamp 31 seconds in the past — must be rejected.
+        let ts_old = ts_now.saturating_sub(31);
+        let old_token = mint_token(&auth_secret, ts_old);
+        let old_hex: String = old_token.iter().map(|b| format!("{:02x}", b)).collect();
+        let req_old = make_ws_request_with_token(&old_hex);
+        let result_old = validate_auth_token(&req_old, Some(auth_secret));
+        assert!(result_old.is_err(), "expired token (31s old) should be rejected");
+        assert!(result_old.unwrap_err().contains("timestamp out of range"),
+            "error should mention timestamp");
+
+        // 3. Token with a tampered HMAC — must be rejected.
+        let mut tampered = token;
+        tampered[8] ^= 0xFF; // flip bits in the HMAC portion
+        let tampered_hex: String = tampered.iter().map(|b| format!("{:02x}", b)).collect();
+        let req_tampered = make_ws_request_with_token(&tampered_hex);
+        let result_tampered = validate_auth_token(&req_tampered, Some(auth_secret));
+        assert!(result_tampered.is_err(), "tampered HMAC should be rejected");
+        assert!(result_tampered.unwrap_err().contains("HMAC mismatch"),
+            "error should mention HMAC mismatch");
+
+        // 4. Missing header — must be rejected.
+        let req_no_hdr = make_ws_request_no_token();
+        let result_no_hdr = validate_auth_token(&req_no_hdr, Some(auth_secret));
+        assert!(result_no_hdr.is_err(), "missing header should be rejected");
+
+        // 5. No auth secret configured — all tokens rejected.
+        let req_any = make_ws_request_with_token(&token_hex);
+        let result_no_secret = validate_auth_token(&req_any, None);
+        assert!(result_no_secret.is_err(), "missing secret should reject any token");
+
+        // 6. Replay detection via nonce cache.
+        let nonce_cache: DashMap<[u8; 40], u64> = DashMap::new();
+        let token_arr = result.unwrap(); // the good token from step 1
+        // First use — insert succeeds.
+        assert!(!nonce_cache.contains_key(&token_arr), "should not yet be in cache");
+        nonce_cache.insert(token_arr, ts_now);
+        // Second use — detected as replay.
+        assert!(nonce_cache.contains_key(&token_arr), "replay token must be detected");
+    }
+
+    // ── test_tls_self_signed ──────────────────────────────────────────────────
+
+    /// `ensure_tls_cert` generates a self-signed cert when none exists, and
+    /// `DangerVerifier` accepts it unconditionally.
+    #[test]
+    fn test_tls_self_signed() {
+        use super::ensure_tls_cert;
+        use hvpn_transport::DangerVerifier;
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        // Install ring crypto provider so rustls is operational.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Use a temp directory so the test is self-contained.
+        let tmp = std::env::temp_dir().join("hvpn_tls_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cert_path = tmp.join("server.pem");
+        let key_path = tmp.join("server.key");
+
+        // Remove any leftovers from a prior run.
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+
+        let cert_path_str = cert_path.to_str().unwrap();
+        let key_path_str = key_path.to_str().unwrap();
+
+        // 1. ensure_tls_cert generates fresh files when they don't exist.
+        let (cert_pem, key_pem) = ensure_tls_cert(cert_path_str, key_path_str)
+            .expect("should generate self-signed cert");
+        assert!(!cert_pem.is_empty(), "cert_pem must not be empty");
+        assert!(!key_pem.is_empty(), "key_pem must not be empty");
+        assert!(cert_path.exists(), "cert file must be written to disk");
+        assert!(key_path.exists(), "key file must be written to disk");
+
+        // 2. ensure_tls_cert loads existing files on subsequent calls.
+        let (cert_pem2, _key_pem2) = ensure_tls_cert(cert_path_str, key_path_str)
+            .expect("should load existing cert");
+        assert_eq!(cert_pem, cert_pem2, "loaded cert must equal generated cert");
+
+        // 3. DangerVerifier accepts the self-signed cert without complaint.
+        //    Parse the DER cert out of the PEM.
+        let der_certs: Vec<CertificateDer<'static>> = {
+            let mut cursor = std::io::Cursor::new(&cert_pem);
+            rustls_pemfile::certs(&mut cursor)
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(!der_certs.is_empty(), "PEM must contain at least one DER cert");
+
+        let verifier = DangerVerifier;
+        let server_name = ServerName::try_from("hvpn-server").unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ));
+
+        let verify_result = verifier.verify_server_cert(
+            &der_certs[0],
+            &[],
+            &server_name,
+            &[],
+            now,
+        );
+        assert!(
+            verify_result.is_ok(),
+            "DangerVerifier must accept self-signed cert: {:?}",
+            verify_result
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
 }
+
+
+
+

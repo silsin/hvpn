@@ -1,0 +1,15 @@
+# HVPN Client Config — Server: 91.107.161.14
+# Connection string (includes server pubkey + auth_secret — regenerate with: hvpn-server setup):
+# eyJwb3J0Ijo0NDMsInB1YmtleSI6IjMyMzY1NmIwZDY2YjA3M2I1NTA1ZTdmMDQ3NTY4NGM4ODk4NDMzZGNlZmZhYzVmNTFiNjNlMTA2ODk2Nzc1NGIiLCJzZXJ2ZXIiOiI5MS4xMDcuMTYxLjE0IiwidmVyc2lvbiI6MSwiYXV0aF9zZWNyZXQiOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIn0
+
+server_address = "91.107.161.14"
+server_port = 443
+use_tls = true
+accept_invalid_certs = true
+tun_ip = "10.8.0.2"
+tun_netmask = "255.255.255.0"
+nat_enabled = false
+post_quantum = false
+stego_mode = false
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+cert_pin_fingerprints = []
