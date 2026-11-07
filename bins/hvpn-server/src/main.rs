@@ -713,7 +713,6 @@ where
     if let Some(router) = state.nat_router.as_ref().map(Arc::clone) {
         use hvpn_core::Frame;
         use hvpn_core::FrameType;
-        use hvpn_tun::LinuxTun;
         use hvpn_tun::TunDevice;
 
         // Assign this client a VPN IP.
@@ -729,44 +728,70 @@ where
             }
         };
 
-        // Duplicate the TUN fd for writing (client→internet direction).
-        let tun_write = {
-            let tun = shared_tun.lock().await;
-            match tun.try_clone() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(%peer, "could not open write TUN fd: {} — falling back to log loop", e);
-                    drop(router);
-                    return Ok(());
-                }
-            }
-        };
-
         let keys_a = session_keys.clone();
         let keys_b = session_keys.clone();
         let peer_a = peer.clone();
         let peer_b = peer.clone();
+        let peer_tun = peer.clone();
         let router_b = router.clone();
         let client_addr = peer_addr;
-        let tun_a = Arc::clone(&shared_tun);  // read TUN (server→client)
-        let tun_b = tun_write;                 // write TUN (client→internet)
 
         // Clone ratchet halves for each task.
-        let ratchet_send_a = std::sync::Arc::clone(&ratchet_send);
-        let ratchet_recv_b = std::sync::Arc::clone(&ratchet_recv);
+        let _ratchet_send_a = std::sync::Arc::clone(&ratchet_send);
+        let _ratchet_recv_b = std::sync::Arc::clone(&ratchet_recv);
 
-        // Task A: server TUN → client WS (server send direction)
+        // Channels: write_tx/write_rx — client→TUN; read_tx/read_rx — TUN→client.
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        let (read_tx, mut read_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+
+        // Single TUN I/O task: owns shared_tun, multiplexes reads and writes.
+        let tun_io: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+            loop {
+                let tun_w = Arc::clone(&shared_tun);
+                let tun_r = Arc::clone(&shared_tun);
+                tokio::select! {
+                    biased;
+                    // Priority: drain writes from client→TUN.
+                    pkt = write_rx.recv() => {
+                        match pkt {
+                            Some(p) => {
+                                if let Err(e) = tun_w.lock().await.write_packet(&p).await {
+                                    warn!(peer = %peer_tun, "TUN write: {}", e);
+                                    break;
+                                }
+                            }
+                            None => break, // write channel closed
+                        }
+                    }
+                    // Read a packet from TUN and forward to Task A.
+                    read_result = async move {
+                        tun_r.lock().await.read_packet().await
+                    } => {
+                        match read_result {
+                            Ok(p) => {
+                                if read_tx.send(p).await.is_err() {
+                                    break; // Task A dropped its receiver
+                                }
+                            }
+                            Err(e) => {
+                                warn!(peer = %peer_tun, "TUN read: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Task A: TUN→client WS (server send direction)
         let tun_to_client = tokio::spawn(async move {
             let codec_a = FrameCodec::new(keys_a.header_key);
             let mut obfs_a = ObfsEngine::new();
             let mut out_seq: u64 = 0;
             loop {
-                let ip_pkt = {
-                    let mut tun = tun_a.lock().await;
-                    match tun.read_packet().await {
-                        Ok(p) => p,
-                        Err(e) => { warn!(peer = %peer_a, "TUN read: {}", e); break; }
-                    }
+                let ip_pkt = match read_rx.recv().await {
+                    Some(p) => p,
+                    None => break, // TUN I/O task closed
                 };
                 match hvpn_crypto::encrypt_packet(&keys_a, &ip_pkt, out_seq, None) {
                     Ok(ciphertext) => {
@@ -788,12 +813,11 @@ where
             }
         });
 
-        // Task B: client WS → server TUN (internet) (server recv direction)
+        // Task B: client WS → TUN (client→internet direction)
         let client_to_tun = tokio::spawn(async move {
             let codec_b = FrameCodec::new(keys_b.header_key);
             let obfs_b = ObfsEngine::new();
             let mut replay = hvpn_core::ReplayWindow::new();
-            let mut tun_b = tun_b;
             while let Some(msg) = source.next().await {
                 match msg {
                     Ok(Message::Binary(data)) => {
@@ -803,8 +827,10 @@ where
                                 if replay.check_and_advance(frame.seq).is_err() { continue; }
                                 match hvpn_crypto::decrypt_packet(&keys_b, &frame.payload, frame.seq, None) {
                                     Ok(ip_pkt) => {
-                                        if let Err(e) = tun_b.write_packet(&ip_pkt).await {
-                                            warn!(peer = %peer_b, "TUN write: {}", e);
+                                        if let Err(e) = write_tx.send(ip_pkt).await
+                                            .map_err(|e| hvpn_common::HvpnError::Tun(e.to_string()))
+                                        {
+                                            warn!(peer = %peer_b, "TUN channel send: {}", e);
                                             break;
                                         }
                                     }
@@ -826,6 +852,7 @@ where
             _ = tun_to_client => {}
             _ = client_to_tun => {}
         }
+        tun_io.abort();
         info!(%peer, "NAT connection closed");
         audit.log(AuditEvent::ClientDisconnected {
             peer_ip: peer_addr.ip().to_string(),
