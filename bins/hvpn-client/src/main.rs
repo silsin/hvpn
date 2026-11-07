@@ -720,14 +720,6 @@ async fn tunnel_loop(
     let header_key = keys.header_key;
     let keys_clone = keys.clone();
 
-    // Initialise the double ratchet for this session (client role).
-    // Split into independent send/recv halves guarded by separate Mutexes so
-    // the upload and download tasks can advance their chains concurrently
-    // without blocking each other.
-    let ratchet = RatchetState::init_client(keys);
-    let ratchet_send = Arc::new(std::sync::Mutex::new(ratchet.send));
-    let ratchet_recv = Arc::new(std::sync::Mutex::new(ratchet.recv));
-
     // Channel for inbound packets to be written to TUN.
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
 
@@ -736,7 +728,6 @@ async fn tunnel_loop(
 
     // Spawn the server→TUN (download) task — runs independently for full duplex.
     let inbound_state = Arc::clone(&state);
-    let ratchet_recv_task = Arc::clone(&ratchet_recv);
     let inbound_task = tokio::spawn(async move {
         let codec_in = FrameCodec::new(header_key);
         let mut replay = ReplayWindow::new();
@@ -756,16 +747,7 @@ async fn tunnel_loop(
                         Ok(frame) => {
                             if frame.frame_type != FrameType::Data { continue; }
                             if replay.check_and_advance(frame.seq).is_err() { continue; }
-                            // Derive the per-packet decryption key from the recv ratchet.
-                            let msg_key = ratchet_recv_task.lock().unwrap().next_key();
-                            // Build a throw-away SessionKeys with the ratchet key as recv_key.
-                            let ratchet_session = hvpn_crypto::SessionKeys {
-                                send_key: [0u8; 32],
-                                recv_key: msg_key,
-                                header_key: keys_clone.header_key,
-                                mac_key: keys_clone.mac_key,
-                            };
-                            match decrypt_packet(&ratchet_session, &frame.payload, frame.seq, None) {
+                            match decrypt_packet(&keys_clone, &frame.payload, frame.seq, None) {
                                 Ok(ip_pkt) => {
                                     total_in = total_in.wrapping_add(ip_pkt.len() as u64);
                                     if inbound_tx.send(ip_pkt).await.is_err() { break; }
@@ -807,15 +789,7 @@ async fn tunnel_loop(
             tun_result = tun.read_packet() => {
                 match tun_result {
                     Ok(pkt) if !pkt.is_empty() => {
-                        // Derive the per-packet encryption key from the send ratchet.
-                        let msg_key = ratchet_send.lock().unwrap().next_key();
-                        let ratchet_session = hvpn_crypto::SessionKeys {
-                            send_key: msg_key,
-                            recv_key: [0u8; 32],
-                            header_key: keys.header_key,
-                            mac_key: keys.mac_key,
-                        };
-                        let ciphertext = encrypt_packet(&ratchet_session, &pkt, *seq, None)
+                        let ciphertext = encrypt_packet(&keys, &pkt, *seq, None)
                             .context("encrypt failed")?;
 
                         // Minimal padding: 2-byte header + 0-16 bytes random.
@@ -868,3 +842,4 @@ async fn tunnel_loop(
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
+
