@@ -234,14 +234,29 @@ type WsStream = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
 
+type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
+type WsSource = futures_util::stream::SplitStream<WsStream>;
+
 /// WebSocket transport with realistic browser-like upgrade headers.
+/// Uses split send/recv halves to allow concurrent full-duplex operation
+/// without mutex deadlock.
 #[derive(Clone)]
 pub struct WebSocketTransport {
-    stream: Arc<Mutex<WsStream>>,
+    sink: Arc<Mutex<WsSink>>,
+    source: Arc<Mutex<WsSource>>,
     pub domain_front: Option<DomainFrontConfig>,
 }
 
 impl WebSocketTransport {
+    fn from_stream(stream: WsStream, domain_front: Option<DomainFrontConfig>) -> Self {
+        use futures_util::StreamExt;
+        let (sink, source) = stream.split();
+        Self {
+            sink: Arc::new(Mutex::new(sink)),
+            source: Arc::new(Mutex::new(source)),
+            domain_front,
+        }
+    }
     /// Connect to `ws://host:port/path` without TLS (plain WebSocket).
     pub async fn connect_plain(cfg: &TransportConfig) -> Result<Self, HvpnError> {
         use tokio_tungstenite::connect_async;
@@ -275,10 +290,7 @@ impl WebSocketTransport {
             .await
             .map_err(|e| HvpnError::Transport(e.to_string()))?;
 
-        Ok(Self {
-            stream: Arc::new(Mutex::new(ws_stream)),
-            domain_front: None,
-        })
+        Ok(Self::from_stream(ws_stream, None))
     }
 
     /// Connect to `wss://host:port/path` with browser-like headers.
@@ -355,10 +367,7 @@ impl WebSocketTransport {
                 .await
                 .map_err(|e| HvpnError::Transport(e.to_string()))?;
 
-        Ok(Self {
-            stream: Arc::new(Mutex::new(ws_stream)),
-            domain_front: None,
-        })
+        Ok(Self::from_stream(ws_stream, None))
     }
 
     /// Connect with domain fronting: TLS SNI uses `front_domain`, HTTP Host uses `real_host`.
@@ -415,17 +424,15 @@ impl WebSocketTransport {
                 .await
                 .map_err(|e| HvpnError::Transport(e.to_string()))?;
 
-        Ok(Self {
-            stream: Arc::new(Mutex::new(ws_stream)),
-            domain_front: Some(domain_front),
-        })
+        Ok(Self::from_stream(ws_stream, Some(domain_front)))
     }
 }
 
 #[async_trait]
 impl Transport for WebSocketTransport {
     async fn send(&self, data: Vec<u8>) -> Result<(), HvpnError> {
-        let mut guard = self.stream.lock().await;
+        use futures_util::SinkExt;
+        let mut guard = self.sink.lock().await;
         guard
             .send(Message::Binary(data))
             .await
@@ -433,27 +440,26 @@ impl Transport for WebSocketTransport {
     }
 
     async fn recv(&self) -> Result<Vec<u8>, HvpnError> {
-        let mut guard = self.stream.lock().await;
+        use futures_util::StreamExt;
+        let mut guard = self.source.lock().await;
         loop {
             match guard.next().await {
                 Some(Ok(Message::Binary(bytes))) => return Ok(bytes),
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
-                    // ignore control frames, keep waiting
-                    continue;
-                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
                 Some(Ok(Message::Close(_))) | None => {
                     return Err(HvpnError::Transport("connection closed".to_string()));
                 }
-                Some(Ok(_)) => continue, // text frames: skip
+                Some(Ok(_)) => continue,
                 Some(Err(e)) => return Err(HvpnError::Transport(e.to_string())),
             }
         }
     }
 
     async fn close(&self) -> Result<(), HvpnError> {
-        let mut guard = self.stream.lock().await;
+        use futures_util::SinkExt;
+        let mut guard = self.sink.lock().await;
         guard
-            .close(None)
+            .close()
             .await
             .map_err(|e| HvpnError::Transport(e.to_string()))
     }
@@ -539,3 +545,4 @@ mod tests {
         }
     }
 }
+
