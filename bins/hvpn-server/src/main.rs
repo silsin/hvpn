@@ -702,8 +702,8 @@ where
     // Split into independent send/recv halves guarded by separate Mutexes so
     // both directions can advance concurrently without blocking.
     let ratchet = RatchetState::init_server(&session_keys);
-    let ratchet_send = std::sync::Arc::new(std::sync::Mutex::new(ratchet.send));
-    let ratchet_recv = std::sync::Arc::new(std::sync::Mutex::new(ratchet.recv));
+    let _ratchet_send = std::sync::Arc::new(std::sync::Mutex::new(ratchet.send));
+    let _ratchet_recv = std::sync::Arc::new(std::sync::Mutex::new(ratchet.recv));
 
     // Save the header key so we can build fresh FrameCodec instances per task.
     let header_key = session_keys.header_key;
@@ -736,26 +736,47 @@ where
         let router_b = router.clone();
         let client_addr = peer_addr;
 
-        // Clone ratchet halves for each task.
-        let _ratchet_send_a = std::sync::Arc::clone(&ratchet_send);
-        let _ratchet_recv_b = std::sync::Arc::clone(&ratchet_recv);
-
         // Channels: write_tx/write_rx — client→TUN; read_tx/read_rx — TUN→client.
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
         let (read_tx, mut read_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
 
         // Single TUN I/O task: owns shared_tun, multiplexes reads and writes.
+        //
+        // Design: a dedicated inner read sub-task runs continuously and is
+        // never cancelled — it holds the TUN lock only for the duration of
+        // each read_packet() call, then sends the result on an internal mpsc.
+        // This means:
+        //   • TUN reads are never silently abandoned mid-flight (fixing the
+        //     "dropped async move future" packet-loss path).
+        //   • Writes and reads progress concurrently; the outer loop's
+        //     non-biased select! ensures completed reads are forwarded
+        //     promptly even when writes are also available, preventing
+        //     write-starvation of the server→client path.
         let tun_io: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+            // Internal channel: read sub-task → outer loop.
+            let (tun_read_tx, mut tun_read_rx) =
+                tokio::sync::mpsc::channel::<Result<Vec<u8>, hvpn_common::HvpnError>>(512);
+
+            // Dedicated read sub-task: loops forever reading from TUN and
+            // forwarding completed packets. This future is never dropped
+            // mid-read, so kernel-delivered data is never discarded.
+            let shared_tun_for_read = Arc::clone(&shared_tun);
+            let _read_sub: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+                loop {
+                    let result = shared_tun_for_read.lock().await.read_packet().await;
+                    if tun_read_tx.send(result).await.is_err() {
+                        break; // outer loop dropped its receiver
+                    }
+                }
+            });
+
             loop {
-                let tun_w = Arc::clone(&shared_tun);
-                let tun_r = Arc::clone(&shared_tun);
                 tokio::select! {
-                    biased;
-                    // Priority: drain writes from client→TUN.
+                    // Write arm: forward a client→TUN packet.
                     pkt = write_rx.recv() => {
                         match pkt {
                             Some(p) => {
-                                if let Err(e) = tun_w.lock().await.write_packet(&p).await {
+                                if let Err(e) = shared_tun.lock().await.write_packet(&p).await {
                                     warn!(peer = %peer_tun, "TUN write: {}", e);
                                     break;
                                 }
@@ -763,20 +784,19 @@ where
                             None => break, // write channel closed
                         }
                     }
-                    // Read a packet from TUN and forward to Task A.
-                    read_result = async move {
-                        tun_r.lock().await.read_packet().await
-                    } => {
+                    // Read arm: forward a completed TUN read to Task A.
+                    read_result = tun_read_rx.recv() => {
                         match read_result {
-                            Ok(p) => {
+                            Some(Ok(p)) => {
                                 if read_tx.send(p).await.is_err() {
                                     break; // Task A dropped its receiver
                                 }
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 warn!(peer = %peer_tun, "TUN read: {}", e);
                                 break;
                             }
+                            None => break, // read sub-task exited
                         }
                     }
                 }
