@@ -16,12 +16,15 @@ mod service;
 #[cfg(target_os = "windows")]
 mod install;
 
-use hvpn_common::{Config, RelayHopConfig};
+mod supervisor;
+pub use supervisor::run_client;
+
+use hvpn_common::RelayHopConfig;
 use hvpn_core::{Frame, FrameCodec};
-use hvpn_crypto::{encrypt_packet, perform_handshake_client, RatchetState};
+use hvpn_crypto::encrypt_packet;
 use hvpn_obfs::ObfsEngine;
-use hvpn_transport::{Transport, TransportConfig, WebSocketTransport};
-use hvpn_tun::{StubTun, TunDevice};
+use hvpn_transport::{Transport, WebSocketTransport};
+use hvpn_tun::TunDevice;
 
 /// HVPN client — connects to an HVPN server and tunnels IP traffic.
 #[derive(Parser, Debug)]
@@ -30,6 +33,62 @@ struct Cli {
     /// Path to the TOML configuration file.
     #[arg(long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Import a link from your server (akbar://v1/...) and connect with it.
+    #[arg(long)]
+    link: Option<String>,
+}
+
+/// Writes log lines to stdout and to `client.log` next to the saved profiles,
+/// so users can attach the file when reporting a problem.
+struct LogTee(Option<Arc<std::fs::File>>);
+
+impl std::io::Write for LogTee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stdout().write_all(buf);
+        if let Some(f) = &self.0 {
+            let _ = (&**f).write_all(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stdout().flush();
+        Ok(())
+    }
+}
+
+/// Path of the client log file.
+fn log_file_path() -> PathBuf {
+    hvpn_common::profiles_path().with_file_name("client.log")
+}
+
+fn open_log_file() -> Option<Arc<std::fs::File>> {
+    let path = log_file_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Keep the log from growing forever: start fresh past 2 MiB.
+    if std::fs::metadata(&path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+        .map(Arc::new)
+}
+
+/// Import a link from `--link`: save it as a profile and make it the active one.
+fn import_link(link: &str) -> Result<String> {
+    let profile = hvpn_common::ConnectionProfile::from_link(link)
+        .map_err(|e| anyhow::anyhow!("that link isn't valid: {e}"))?;
+    let mut profiles = hvpn_common::load_profiles();
+    let name = hvpn_common::upsert_profile(&mut profiles, profile);
+    hvpn_common::save_profiles(&profiles)
+        .map_err(|e| anyhow::anyhow!("couldn't save the profile: {e}"))?;
+    hvpn_common::save_active_profile(&name);
+    Ok(name)
 }
 
 // ── Shared daemon state ────────────────────────────────────────────────────────
@@ -52,15 +111,49 @@ impl std::fmt::Display for TransportKind {
     }
 }
 
+/// Where the connection currently is, as shown to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Not connected, and not trying to be.
+    Idle,
+    /// First attempt in progress.
+    Connecting,
+    /// Tunnel is up.
+    Connected,
+    /// Lost or failed; trying again automatically.
+    Reconnecting,
+    /// Gave up; `last_error` says why. Needs the user.
+    Failed,
+}
+
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Idle => "idle",
+            Phase::Connecting => "connecting",
+            Phase::Connected => "connected",
+            Phase::Reconnecting => "reconnecting",
+            Phase::Failed => "failed",
+        }
+    }
+}
+
+/// Lock-free packet byte counters, updated from the tunnel hot path.
+#[derive(Default)]
+pub struct Counters {
+    pub bytes_in: std::sync::atomic::AtomicU64,
+    pub bytes_out: std::sync::atomic::AtomicU64,
+}
+
 /// In-memory state shared between the tunnel loop and the control socket.
 pub struct AppState {
     pub connected: bool,
     pub transport_kind: TransportKind,
-    /// Round-trip time in milliseconds (placeholder).
+    /// Round-trip time through the tunnel in milliseconds (0 = unknown).
     pub rtt_ms: u64,
-    /// Bytes received from server.
+    /// Bytes received from server this session.
     pub bytes_in: u64,
-    /// Bytes sent to server.
+    /// Bytes sent to server this session.
     pub bytes_out: u64,
     /// Number of active streams (placeholder).
     pub active_streams: u32,
@@ -68,6 +161,30 @@ pub struct AppState {
     pub relay_chain: Vec<RelayHopConfig>,
     /// Config path used to connect.
     pub config_path: String,
+
+    // ── Connection lifecycle (see supervisor.rs) ──
+    pub phase: Phase,
+    /// The user wants the tunnel up (false after Disconnect or a fatal error).
+    pub want_connected: bool,
+    /// Name of the profile selected by the user, if any.
+    pub active_profile: Option<String>,
+    /// Display name of the server being used.
+    pub server: String,
+    /// Latest problem, in plain language.
+    pub last_error: Option<String>,
+    /// Current connection attempt (1-based) while connecting/reconnecting.
+    pub attempt: u32,
+    /// When the next automatic retry happens.
+    pub retry_at: Option<std::time::Instant>,
+    pub connected_at: Option<std::time::Instant>,
+    /// Smoothed throughput in bytes per second.
+    pub speed_in: u64,
+    pub speed_out: u64,
+    pub counters: Arc<Counters>,
+    /// Wakes the supervisor (connect / disconnect / retry now).
+    pub wake: Arc<tokio::sync::Notify>,
+    /// Cancels the running session.
+    pub session_cancel: Option<CancellationToken>,
 }
 
 impl AppState {
@@ -81,6 +198,19 @@ impl AppState {
             active_streams: 0,
             relay_chain: Vec::new(),
             config_path: String::new(),
+            phase: Phase::Idle,
+            want_connected: false,
+            active_profile: None,
+            server: String::new(),
+            last_error: None,
+            attempt: 0,
+            retry_at: None,
+            connected_at: None,
+            speed_in: 0,
+            speed_out: 0,
+            counters: Arc::new(Counters::default()),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            session_cancel: None,
         }
     }
 }
@@ -111,23 +241,54 @@ fn dispatch(cmd: &serde_json::Value, state: &Arc<Mutex<AppState>>) -> serde_json
                     "bytes_in": s.bytes_in,
                     "bytes_out": s.bytes_out,
                     "active_streams": s.active_streams,
+                    "phase": s.phase.as_str(),
+                    "server": s.server,
+                    "profile": s.active_profile,
+                    "last_error": s.last_error,
+                    "attempt": s.attempt,
+                    "retry_in_secs": s.retry_at.map(|t| {
+                        t.saturating_duration_since(std::time::Instant::now()).as_secs()
+                    }),
+                    "uptime_secs": s.connected_at.map(|t| t.elapsed().as_secs()),
+                    "speed_in": s.speed_in,
+                    "speed_out": s.speed_out,
                 }
             })
         }
         "connect" => {
-            let path = cmd
-                .get("config")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let mut s = state.lock().unwrap();
-            s.connected = true;
-            s.config_path = path;
+            // Optional "profile": name or server of a saved profile to use.
+            let profile = cmd.get("profile").and_then(Value::as_str).map(String::from);
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            let switching = match &profile {
+                Some(name) if s.active_profile.as_deref() != Some(name.as_str()) => {
+                    hvpn_common::save_active_profile(name);
+                    s.active_profile = Some(name.clone());
+                    true
+                }
+                _ => false,
+            };
+            s.want_connected = true;
+            s.last_error = None;
+            if matches!(s.phase, Phase::Failed | Phase::Idle) {
+                s.phase = Phase::Connecting;
+            }
+            if switching {
+                // Drop the current session; the supervisor reconnects to the new server.
+                if let Some(c) = &s.session_cancel {
+                    c.cancel();
+                }
+            }
+            s.wake.notify_one();
             json!({"ok": true})
         }
         "disconnect" => {
-            let mut s = state.lock().unwrap();
-            s.connected = false;
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            s.want_connected = false;
+            s.last_error = None;
+            if let Some(c) = &s.session_cancel {
+                c.cancel();
+            }
+            s.wake.notify_one();
             json!({"ok": true})
         }
         "switch-transport" => {
@@ -184,7 +345,13 @@ fn dispatch(cmd: &serde_json::Value, state: &Arc<Mutex<AppState>>) -> serde_json
         }
         "list_profiles" => {
             let profiles = hvpn_common::load_profiles();
-            json!({"ok": true, "profiles": profiles})
+            let names: Vec<String> = profiles.iter().map(|p| p.display_name()).collect();
+            let active = state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active_profile
+                .clone();
+            json!({"ok": true, "profiles": profiles, "names": names, "active": active})
         }
         "activate_profile" => {
             let name = match cmd.get("name").and_then(Value::as_str) {
@@ -192,11 +359,18 @@ fn dispatch(cmd: &serde_json::Value, state: &Arc<Mutex<AppState>>) -> serde_json
                 None => return json!({"ok": false, "error": "missing 'name' field"}),
             };
             let profiles = hvpn_common::load_profiles();
-            match profiles.iter().find(|p| p.name.as_deref() == Some(&name) || p.server == name) {
+            match hvpn_common::find_profile(&profiles, &name) {
                 Some(p) => {
-                    let mut s = state.lock().unwrap();
-                    s.connected = false; // trigger reconnect
-                    s.config_path = p.server.clone();
+                    let display = p.display_name();
+                    hvpn_common::save_active_profile(&display);
+                    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+                    s.active_profile = Some(display);
+                    s.want_connected = true;
+                    s.last_error = None;
+                    if let Some(c) = &s.session_cancel {
+                        c.cancel();
+                    }
+                    s.wake.notify_one();
                     json!({"ok": true, "server": p.server})
                 }
                 None => json!({"ok": false, "error": "profile not found"}),
@@ -381,11 +555,14 @@ mod control {
 async fn main() -> Result<()> {
     install_crypto_provider();
     // Initialise structured logging.
+    let log_file = open_log_file();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("hvpn_client=info".parse()?),
         )
+        .with_ansi(false)
+        .with_writer(move || LogTee(log_file.clone()))
         .init();
 
     // Windows: handle service / install / uninstall flags before normal CLI
@@ -416,6 +593,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if let Some(link) = cli.link.as_deref() {
+        let name = import_link(link)?;
+        info!("imported server '{}' and selected it", name);
+    }
+
     // Graceful shutdown token; cancelled by Ctrl+C in interactive mode.
     let shutdown = CancellationToken::new();
     {
@@ -429,270 +611,6 @@ async fn main() -> Result<()> {
     }
 
     run_client(&cli.config.to_string_lossy(), shutdown).await
-}
-
-/// Core client loop shared by the interactive and Windows-service entry points.
-///
-/// Runs the control socket listener, performs the handshake, connects the
-/// transport, and pumps packets through the TUN device until `shutdown` is
-/// cancelled.
-pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Result<()> {
-    // Resolve config path: if the given path doesn't exist, try the platform default.
-    let resolved_config = if std::path::Path::new(config_path).exists() {
-        config_path.to_string()
-    } else {
-        #[cfg(target_os = "windows")]
-        let default = std::env::var("APPDATA")
-            .map(|a| format!(r"{}\HVPN\client.toml", a))
-            .unwrap_or_else(|_| config_path.to_string());
-        #[cfg(not(target_os = "windows"))]
-        let default = std::env::var("HOME")
-            .map(|h| format!("{}/.config/hvpn/client.toml", h))
-            .unwrap_or_else(|_| config_path.to_string());
-        default
-    };
-
-    // Load configuration, falling back to saved profiles.
-    let cfg = match Config::load_and_validate(&resolved_config) {
-        Ok(c) => c,
-        Err(_) => {
-            let profiles = hvpn_common::load_profiles();
-            if let Some(first) = profiles.first() {
-                eprintln!("[hvpn-client] No config file found. Using saved profile: {}", first.server);
-                Config {
-                    server_address: first.server.clone(),
-                    server_port: first.port,
-                    tls_cert_path: String::new(),
-                    obfs_profile: hvpn_common::ObfsProfile::Browser,
-                    relay_chain: None,
-                    stego_mode: false,
-                    post_quantum: false,
-                    nat_enabled: false,
-                    tun_ip: "10.8.0.2".to_string(),
-                    tun_netmask: "255.255.255.0".to_string(),
-                    dns_servers: vec!["1.1.1.1".to_string()],
-                    cert_pin_fingerprints: vec![],
-                    use_tls: false,
-                    accept_invalid_certs: true,
-                }
-            } else {
-                eprintln!("[hvpn-client] No config found. On Windows, use the HVPN tray app to set up. On Linux, run: hvpn-client --config <path>");
-                return Err(anyhow::anyhow!("no configuration available"));
-            }
-        }
-    };
-
-    info!(
-        server = %cfg.server_address,
-        port   = cfg.server_port,
-        "starting HVPN client"
-    );
-
-    // Initialise shared state.
-    let state = Arc::new(Mutex::new(AppState::new()));
-
-    // Spawn control socket listener.
-    {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            control::listen_control_socket(state).await;
-        });
-    }
-
-    // Open TUN device — WinTun on Windows, LinuxTun on Linux, StubTun as fallback.
-    #[cfg(target_os = "windows")]
-    let mut tun: Box<dyn TunDevice> = {
-        use hvpn_tun::WinTunDevice;
-        match WinTunDevice::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address).await {
-            Ok(dev) => {
-                info!("WinTun device opened successfully");
-                if let Err(e) = dev.set_mtu(1380) {
-                    tracing::warn!("failed to set TUN MTU: {}", e);
-                }
-                // Wait for the WinTun adapter to fully initialise before touching the routing table.
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                // Get real gateway BEFORE setting VPN default route (otherwise VPN wins and gateway lookup returns VPN).
-                let real_gateway = hvpn_tun::get_default_gateway().ok();
-                info!("real gateway detected: {:?}", real_gateway);
-
-                // FIRST: add server exclusion route via real gateway.
-                if let Some(ref gateway) = real_gateway {
-                    // Delete stale route first.
-                    let _ = std::process::Command::new("route")
-                        .args(["delete", &cfg.server_address])
-                        .output();
-                    match std::process::Command::new("route")
-                        .args(["add", &cfg.server_address, "mask", "255.255.255.255", gateway, "metric", "1"])
-                        .output() {
-                        Ok(o) if o.status.success() => info!("server exclusion route set via {}", gateway),
-                        Ok(o) => tracing::warn!("route add server exclusion failed: {}", String::from_utf8_lossy(&o.stdout)),
-                        Err(e) => tracing::warn!("route add server exclusion error: {}", e),
-                    }
-                }
-
-                // SECOND: set VPN default route.
-                match hvpn_tun::set_default_route("hvpn0", "10.8.0.1") {
-                    Ok(_) => info!("default route set through VPN tunnel OK"),
-                    Err(e) => tracing::warn!("set_default_route failed: {}", e),
-                }
-                // Set DNS servers.
-                if !cfg.dns_servers.is_empty() {
-                    let _ = hvpn_tun::set_dns("hvpn0", &cfg.dns_servers);
-                }
-                // Log the default routes so we can confirm the VPN route was installed.
-                match std::process::Command::new("route").arg("print").output() {
-                    Ok(out) => {
-                        let text = String::from_utf8_lossy(&out.stdout);
-                        for line in text.lines().filter(|l| l.contains("0.0.0.0")) {
-                            info!("route: {}", line.trim());
-                        }
-                    }
-                    Err(e) => tracing::warn!("could not run `route print`: {}", e),
-                }
-                Box::new(dev)
-            }
-            Err(e) => {
-                tracing::warn!("WinTun not available ({}), using stub — traffic will NOT be routed", e);
-                Box::new(StubTun::new())
-            }
-        }
-    };
-    #[cfg(target_os = "linux")]
-    let mut tun: Box<dyn TunDevice> = {
-        use hvpn_tun::LinuxTun;
-        match LinuxTun::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address).await {
-            Ok(dev) => {
-                info!("Linux TUN device opened successfully");
-                Box::new(dev)
-            }
-            Err(e) => {
-                tracing::warn!("TUN not available ({}), using stub", e);
-                Box::new(StubTun::new())
-            }
-        }
-    };
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let mut tun: Box<dyn TunDevice> = Box::new(StubTun::new());
-
-    // Connect transport.
-    let transport_cfg = TransportConfig::new(cfg.server_address.clone(), cfg.server_port, "/hvpn");
-    let transport_cfg = {
-        let mut tc = transport_cfg;
-        tc.danger_accept_invalid_certs = cfg.accept_invalid_certs;
-
-        // Load auth_secret from saved profile matching this server.
-        let profiles = hvpn_common::load_profiles();
-        if let Some(profile) = profiles.iter().find(|p| p.server == cfg.server_address) {
-            if profile.auth_secret.len() == 64 {
-                let secret_bytes: Vec<u8> = (0..profile.auth_secret.len())
-                    .step_by(2)
-                    .filter_map(|i| {
-                        u8::from_str_radix(profile.auth_secret.get(i..i+2)?, 16).ok()
-                    })
-                    .collect();
-                if secret_bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&secret_bytes);
-                    tc.auth_secret = Some(arr);
-                    info!("auth secret loaded from saved profile");
-                }
-            }
-        }
-
-        tc
-    };
-
-    // Load server pubkey from saved profiles if available, else use zeroed key.
-    let server_pubkey: [u8; 32] = {
-        let profiles = hvpn_common::load_profiles();
-        let matching = profiles.iter().find(|p| p.server == cfg.server_address);
-        if let Some(profile) = matching {
-            let bytes = (0..profile.pubkey.len())
-                .step_by(2)
-                .filter_map(|i| u8::from_str_radix(profile.pubkey.get(i..i+2)?, 16).ok())
-                .collect::<Vec<u8>>();
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                info!("using server pubkey from saved profile");
-                arr
-            } else {
-                tracing::warn!("saved profile pubkey invalid length, using zeroed key");
-                [0u8; 32]
-            }
-        } else {
-            tracing::warn!("no saved profile found for {}, using zeroed server pubkey — crypto handshake will fail", cfg.server_address);
-            [0u8; 32]
-        }
-    };
-    let (ephemeral_pub, session_keys) = perform_handshake_client(&server_pubkey)
-        .context("client handshake failed")?;
-
-    info!(pubkey = %hex_encode(&ephemeral_pub), "handshake keys derived");
-
-    let codec = FrameCodec::new(session_keys.header_key);
-    let mut obfs = ObfsEngine::new();
-    let mut seq: u64 = 0;
-
-    // Attempt to connect; log and exit gracefully on failure (server may not
-    // be running in Phase 1 testing).
-    let transport_result = if cfg.use_tls {
-        WebSocketTransport::connect(&transport_cfg).await
-    } else {
-        WebSocketTransport::connect_plain(&transport_cfg).await
-    };
-    let transport: Option<WebSocketTransport> = match transport_result {
-        Ok(t) => {
-            info!("WebSocket transport connected");
-            // Send our ephemeral pubkey to the server as the first message
-            // so the server can complete the X25519 handshake.
-            if let Err(e) = t.send(ephemeral_pub.to_vec()).await {
-                tracing::warn!("failed to send ephemeral pubkey to server: {}", e);
-            } else {
-                info!("crypto handshake pubkey sent to server");
-            }
-            {
-                let mut s = state.lock().unwrap();
-                s.connected = true;
-            }
-            Some(t)
-        }
-        Err(e) => {
-            info!("transport not available (Phase 1 stub mode): {}", e);
-            None
-        }
-    };
-
-    info!("entering tunnel loop (stop signal to exit)");
-
-    // Main tunnel loop — graceful shutdown on the cancellation token.
-    let result = tokio::select! {
-        _ = shutdown.cancelled() => {
-            info!("shutdown requested, stopping");
-            Ok(())
-        }
-        res = tunnel_loop(
-            &mut tun,
-            transport.as_ref(),
-            &codec,
-            &mut obfs,
-            &mut seq,
-            &session_keys,
-            Arc::clone(&state),
-        ) => res,
-    };
-
-    if let Some(t) = transport.as_ref() {
-        let _ = t.close().await;
-    }
-
-    {
-        let mut s = state.lock().unwrap();
-        s.connected = false;
-    }
-
-    result
 }
 
 async fn tunnel_loop(
@@ -723,6 +641,20 @@ async fn tunnel_loop(
     let header_key = keys.header_key;
     let keys_clone = keys.clone();
 
+    // Lock-free byte counters (folded into totals/speeds by the supervisor).
+    use std::sync::atomic::Ordering::Relaxed;
+    let counters_out = state.lock().unwrap_or_else(|p| p.into_inner()).counters.clone();
+    let counters_in = Arc::clone(&counters_out);
+
+    /// Aborts the wrapped task when dropped, so cancelling the tunnel (or an
+    /// early return) never leaves the download task running.
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     // Channel for inbound packets to be written to TUN.
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
 
@@ -730,11 +662,9 @@ async fn tunnel_loop(
     let transport_rx = transport.clone();
 
     // Spawn the server→TUN (download) task — runs independently for full duplex.
-    let inbound_state = Arc::clone(&state);
-    let inbound_task = tokio::spawn(async move {
+    let _inbound_task = AbortOnDrop(tokio::spawn(async move {
         let codec_in = FrameCodec::new(header_key);
         let mut replay = ReplayWindow::new();
-        let mut total_in: u64 = 0;
 
         loop {
             match transport_rx.recv().await {
@@ -752,14 +682,8 @@ async fn tunnel_loop(
                             if replay.check_and_advance(frame.seq).is_err() { continue; }
                             match decrypt_packet(&keys_clone, &frame.payload, frame.seq, None) {
                                 Ok(ip_pkt) => {
-                                    total_in = total_in.wrapping_add(ip_pkt.len() as u64);
+                                    counters_in.bytes_in.fetch_add(ip_pkt.len() as u64, Relaxed);
                                     if inbound_tx.send(ip_pkt).await.is_err() { break; }
-                                    // Update state every 100 packets to avoid lock contention.
-                                    if total_in % (100 * 1400) == 0 {
-                                        let mut s = inbound_state.lock().unwrap();
-                                        s.bytes_in = s.bytes_in.wrapping_add(total_in);
-                                        total_in = 0;
-                                    }
                                 }
                                 Err(_) => continue,
                             }
@@ -773,16 +697,21 @@ async fn tunnel_loop(
                 }
             }
         }
-    });
+        // Dropping `inbound_tx` here tells the main loop the server is gone.
+    }));
 
     // Main TUN→server (upload) loop, interleaved with writing inbound packets.
-    let mut total_out: u64 = 0;
     let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut tun_read_errors: u32 = 0;
 
     loop {
         tokio::select! {
             // Write inbound packets to TUN when available.
-            Some(ip_pkt) = inbound_rx.recv() => {
+            inbound = inbound_rx.recv() => {
+                let Some(ip_pkt) = inbound else {
+                    tracing::warn!("connection to server lost");
+                    break;
+                };
                 if let Err(e) = tun.write_packet(&ip_pkt).await {
                     tracing::warn!("tun write error: {}", e);
                     break;
@@ -792,6 +721,7 @@ async fn tunnel_loop(
             tun_result = tun.read_packet() => {
                 match tun_result {
                     Ok(pkt) if !pkt.is_empty() => {
+                        tun_read_errors = 0;
                         let ciphertext = encrypt_packet(&keys, &pkt, *seq, None)
                             .context("encrypt failed")?;
 
@@ -815,22 +745,20 @@ async fn tunnel_loop(
 
                         let len = padded.len() as u64;
                         if transport.send(padded).await.is_err() { break; }
-                        total_out = total_out.wrapping_add(len);
+                        counters_out.bytes_out.fetch_add(len, Relaxed);
                         *seq = seq.wrapping_add(1);
-
-                        // Update state periodically, not every packet.
-                        if *seq % 100 == 0 {
-                            let mut s = state.lock().unwrap();
-                            s.bytes_out = s.bytes_out.wrapping_add(total_out);
-                            total_out = 0;
-                        }
                     }
                     Ok(_) => {
                         // Empty packet — small yield to avoid busy loop.
                         tokio::task::yield_now().await;
                     }
                     Err(e) => {
+                        tun_read_errors += 1;
                         tracing::warn!("tun read error: {}", e);
+                        if tun_read_errors >= 20 {
+                            // The adapter is gone; end the session so we can recover.
+                            return Err(anyhow::anyhow!("network adapter stopped responding"));
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     }
                 }
@@ -838,11 +766,7 @@ async fn tunnel_loop(
         }
     }
 
-    inbound_task.abort();
     Ok(())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
 

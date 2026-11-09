@@ -114,6 +114,16 @@ fn ensure_tls_cert(cert_path: &str, key_path: &str) -> Result<(Vec<u8>, Vec<u8>)
     Ok((cert_pem, key_pem))
 }
 
+/// Hex SHA-256 of the first certificate in `cert_pem` (DER bytes), the value
+/// clients pin. Returns `None` if the PEM has no certificate.
+fn cert_sha256_hex(cert_pem: &[u8]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut cursor = std::io::Cursor::new(cert_pem);
+    let cert = rustls_pemfile::certs(&mut cursor).next()?.ok()?;
+    let digest = Sha256::digest(cert.as_ref());
+    Some(digest.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
 /// Build a `rustls::ServerConfig` from PEM cert and key bytes.
 fn build_rustls_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<rustls::ServerConfig>> {
     use rustls::pki_types::PrivateKeyDer;
@@ -249,6 +259,9 @@ async fn main() -> Result<()> {
     let tls_acceptor: Option<tokio_rustls::TlsAcceptor> =
         match ensure_tls_cert(tls_cert_path, tls_key_path) {
             Ok((cert_pem, key_pem)) => {
+                if let Some(fp) = cert_sha256_hex(&cert_pem) {
+                    info!("TLS certificate SHA-256 (for client pinning): {}", fp);
+                }
                 match build_rustls_server_config(&cert_pem, &key_pem) {
                     Ok(server_cfg) => {
                         info!("TLS enabled — connections will use wss://");
@@ -1008,23 +1021,40 @@ tun_netmask = "255.255.255.0"
     println!("X25519 private key written to {:?} (keep secret!)", config_dir.join("server_x25519.key"));
     println!("Auth secret written to {:?} (keep secret!)", config_dir.join("server.auth"));
 
-    // Build connection string using X25519 pubkey + auth_secret.
-    let conn_json = serde_json::json!({
+    // Create the TLS certificate now so its fingerprint can be pinned by clients.
+    #[cfg(target_os = "windows")]
+    let tls_key_path = r"C:\ProgramData\hvpn\server.key";
+    #[cfg(not(target_os = "windows"))]
+    let tls_key_path = "/etc/hvpn/server.key";
+    let cert_sha256 = match ensure_tls_cert(tls_cert_path, tls_key_path) {
+        Ok((cert_pem, _)) => cert_sha256_hex(&cert_pem).unwrap_or_default(),
+        Err(e) => {
+            eprintln!("warning: could not prepare TLS certificate ({e}); link will not pin it");
+            String::new()
+        }
+    };
+
+    // Build connection string using X25519 pubkey + auth_secret (+ cert pin).
+    let mut conn_json = serde_json::json!({
         "server": ip,
         "port": port,
         "pubkey": x25519_pubkey_hex,
         "version": 1,
         "auth_secret": auth_secret_hex,
     });
+    if !cert_sha256.is_empty() {
+        conn_json["cert_sha256"] = serde_json::Value::String(cert_sha256);
+    }
     let conn_str = URL_SAFE_NO_PAD.encode(conn_json.to_string().as_bytes());
+    let share_link = format!("akbar://v1/{}", conn_str);
 
     // Generate and print QR code.
     let code = QrCode::new(conn_str.as_bytes())?;
     let image = code.render::<unicode::Dense1x2>().build();
     println!("{}", image);
 
-    println!("\nConnection string:\n{}", conn_str);
-    println!("\nScan this QR code in the HVPN tray app, or paste the connection string manually.");
+    println!("\nShare this link with your users (paste it in the HVPN app):\n{}", share_link);
+    println!("\nScan this QR code in the HVPN tray app, or paste the link manually.");
     println!("\nIMPORTANT: The connection string contains the X25519 public key and auth secret.");
 
     Ok(())

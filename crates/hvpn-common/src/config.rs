@@ -237,9 +237,67 @@ pub struct ConnectionProfile {
     /// User-assigned display name (not part of the wire format).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Optional hex SHA-256 of the server's DER certificate (64 hex chars).
+    /// When present the client pins the server certificate instead of
+    /// accepting any certificate.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cert_sha256: String,
 }
 
+/// URL schemes accepted for shareable links.
+const LINK_SCHEMES: [&str; 2] = ["akbar://", "hvpn://"];
+/// Canonical scheme + version used when generating links.
+const LINK_PREFIX: &str = "akbar://v1/";
+
 impl ConnectionProfile {
+    /// Parse a shareable link or a bare connection string.
+    ///
+    /// Accepted forms (surrounding whitespace is ignored):
+    /// - `akbar://v1/<connection-string>`
+    /// - `akbar://<connection-string>`
+    /// - `hvpn://...` (same layouts)
+    /// - `<connection-string>`
+    pub fn from_link(input: &str) -> Result<Self, HvpnError> {
+        let mut rest = input.trim();
+        for scheme in LINK_SCHEMES {
+            if rest.len() >= scheme.len()
+                && rest.is_char_boundary(scheme.len())
+                && rest[..scheme.len()].eq_ignore_ascii_case(scheme)
+            {
+                rest = &rest[scheme.len()..];
+                // Optional version segment such as "v1/".
+                if let Some((ver, tail)) = rest.split_once('/') {
+                    let is_version = ver.len() <= 4
+                        && ver.starts_with(['v', 'V'])
+                        && ver[1..].chars().all(|c| c.is_ascii_digit());
+                    if is_version {
+                        rest = tail;
+                    }
+                }
+                break;
+            }
+        }
+        // Tolerate a trailing slash added by some chat apps / browsers.
+        let rest = rest.trim_end_matches('/');
+        if rest.is_empty() {
+            return Err(HvpnError::Config("link is empty".to_string()));
+        }
+        Self::from_connection_string(rest)
+    }
+
+    /// Shareable `akbar://v1/...` link for this profile.
+    pub fn to_link(&self) -> String {
+        format!("{}{}", LINK_PREFIX, self.to_connection_string())
+    }
+
+    /// Name to show in the UI: explicit name, else `server:port`.
+    pub fn display_name(&self) -> String {
+        match &self.name {
+            Some(n) if !n.trim().is_empty() => n.clone(),
+            _ => format!("{}:{}", self.server, self.port),
+        }
+    }
+
     /// Decode a ConnectionProfile from a base64url connection string.
     pub fn from_connection_string(s: &str) -> Result<Self, HvpnError> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -266,6 +324,10 @@ impl ConnectionProfile {
             "version": self.version,
             "auth_secret": self.auth_secret,
         });
+        let mut wire = wire;
+        if !self.cert_sha256.is_empty() {
+            wire["cert_sha256"] = serde_json::Value::String(self.cert_sha256.clone());
+        }
         URL_SAFE_NO_PAD.encode(wire.to_string().as_bytes())
     }
 
@@ -273,6 +335,18 @@ impl ConnectionProfile {
     pub fn validate(&self) -> Result<(), HvpnError> {
         if self.server.is_empty() {
             return Err(HvpnError::Config("server must not be empty".to_string()));
+        }
+        // The server string is later passed to `route`/`netsh` and shown in UI,
+        // so only accept a plain hostname or IP address.
+        if self.server.len() > 253
+            || !self
+                .server
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))
+        {
+            return Err(HvpnError::Config(
+                "server must be a hostname or IP address".to_string(),
+            ));
         }
         if self.port == 0 {
             return Err(HvpnError::Config("port must not be 0".to_string()));
@@ -288,6 +362,14 @@ impl ConnectionProfile {
         {
             return Err(HvpnError::Config(
                 "auth_secret must be exactly 64 hex characters".to_string(),
+            ));
+        }
+        if !self.cert_sha256.is_empty()
+            && (self.cert_sha256.len() != 64
+                || !self.cert_sha256.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(HvpnError::Config(
+                "cert_sha256 must be exactly 64 hex characters".to_string(),
             ));
         }
         Ok(())
@@ -334,6 +416,54 @@ pub fn save_profiles(profiles: &[ConnectionProfile]) -> Result<(), HvpnError> {
         .map_err(|e| HvpnError::Config(format!("json serialize error: {}", e)))?;
     std::fs::write(&path, json).map_err(|e| HvpnError::Io { source: e })?;
     Ok(())
+}
+
+/// Insert `profile`, replacing any existing profile for the same server+port
+/// (so re-importing a link updates it instead of creating duplicates).
+/// Returns the stored profile's display name.
+pub fn upsert_profile(profiles: &mut Vec<ConnectionProfile>, mut profile: ConnectionProfile) -> String {
+    if let Some(existing) = profiles
+        .iter_mut()
+        .find(|p| p.server == profile.server && p.port == profile.port)
+    {
+        // Keep a name the user already chose.
+        if profile.name.is_none() {
+            profile.name = existing.name.clone();
+        }
+        *existing = profile;
+        return existing.display_name();
+    }
+    let name = profile.display_name();
+    profiles.push(profile);
+    name
+}
+
+/// Find a profile by display name, explicit name, or server address.
+pub fn find_profile<'a>(profiles: &'a [ConnectionProfile], key: &str) -> Option<&'a ConnectionProfile> {
+    profiles.iter().find(|p| {
+        p.name.as_deref() == Some(key) || p.server == key || p.display_name() == key
+    })
+}
+
+fn active_profile_path() -> std::path::PathBuf {
+    profiles_path().with_file_name("active_profile.txt")
+}
+
+/// Name of the profile the user last selected, if any.
+pub fn load_active_profile() -> Option<String> {
+    std::fs::read_to_string(active_profile_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Remember the user's selected profile (best effort).
+pub fn save_active_profile(name: &str) {
+    let path = active_profile_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, name);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -492,6 +622,7 @@ mod tests {
             version: 1,
             auth_secret: "b".repeat(64),
             name: Some("my server".to_string()),
+            cert_sha256: String::new(),
         };
         let s = profile.to_connection_string();
         let decoded = ConnectionProfile::from_connection_string(&s).expect("decode failed");
@@ -513,6 +644,7 @@ mod tests {
             version: 1,
             auth_secret: "d".repeat(64),
             name: None,
+            cert_sha256: String::new(),
         };
         let err = profile.validate().unwrap_err();
         let msg = err.to_string();
@@ -533,6 +665,7 @@ mod tests {
                 version: 1,
                 auth_secret: "c".repeat(64),
                 name: Some("server-a".to_string()),
+                cert_sha256: String::new(),
             },
             ConnectionProfile {
                 server: "10.0.0.2".to_string(),
@@ -541,6 +674,7 @@ mod tests {
                 version: 1,
                 auth_secret: "e".repeat(64),
                 name: Some("server-b".to_string()),
+                cert_sha256: String::new(),
             },
         ];
         // Write directly to temp path for isolation.
@@ -554,5 +688,86 @@ mod tests {
         assert_eq!(loaded[1].server, "10.0.0.2");
         // Cleanup
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn sample_profile() -> ConnectionProfile {
+        ConnectionProfile {
+            server: "1.2.3.4".to_string(),
+            port: 443,
+            pubkey: "a".repeat(64),
+            version: 1,
+            auth_secret: "b".repeat(64),
+            name: None,
+            cert_sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn link_roundtrip_and_accepted_forms() {
+        let p = sample_profile();
+        let link = p.to_link();
+        assert!(link.starts_with("akbar://v1/"));
+        let bare = p.to_connection_string();
+        for input in [
+            link.clone(),
+            format!("  {}\n", link),
+            format!("{}/", link),
+            link.replace("akbar://", "hvpn://"),
+            link.replace("akbar://", "AKBAR://"),
+            format!("akbar://{}", bare),
+            bare.clone(),
+        ] {
+            let d = ConnectionProfile::from_link(&input)
+                .unwrap_or_else(|e| panic!("failed on {input:?}: {e}"));
+            assert_eq!(d.server, "1.2.3.4");
+            assert_eq!(d.auth_secret, p.auth_secret);
+        }
+    }
+
+    #[test]
+    fn link_rejects_garbage() {
+        assert!(ConnectionProfile::from_link("").is_err());
+        assert!(ConnectionProfile::from_link("akbar://").is_err());
+        assert!(ConnectionProfile::from_link("akbar://v1/").is_err());
+        assert!(ConnectionProfile::from_link("akbar://v1/not-base64!!").is_err());
+        assert!(ConnectionProfile::from_link("https://example.com").is_err());
+    }
+
+    #[test]
+    fn cert_pin_roundtrips_and_validates() {
+        let mut p = sample_profile();
+        p.cert_sha256 = "c".repeat(64);
+        let d = ConnectionProfile::from_link(&p.to_link()).unwrap();
+        assert_eq!(d.cert_sha256, p.cert_sha256);
+        p.cert_sha256 = "zz".to_string();
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn server_field_must_be_plain_host() {
+        for bad in ["1.2.3.4 mask 0.0.0.0", "<img src=x onerror=alert(1)>", "a'b", "x\"y", "a b", "a;b"] {
+            let mut p = sample_profile();
+            p.server = bad.to_string();
+            assert!(p.validate().is_err(), "should reject {bad:?}");
+        }
+        for ok in ["1.2.3.4", "vpn.example.com", "my-host_1.example.org", "2001:db8::1"] {
+            let mut p = sample_profile();
+            p.server = ok.to_string();
+            assert!(p.validate().is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn upsert_replaces_same_server_and_keeps_name() {
+        let mut list = Vec::new();
+        let mut a = sample_profile();
+        a.name = Some("Home".to_string());
+        upsert_profile(&mut list, a);
+        let mut b = sample_profile();
+        b.auth_secret = "d".repeat(64);
+        upsert_profile(&mut list, b);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name.as_deref(), Some("Home"));
+        assert_eq!(list[0].auth_secret, "d".repeat(64));
     }
 }
