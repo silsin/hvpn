@@ -7,6 +7,10 @@ use tokio::time::{sleep, Duration};
 /// Maximum random padding added per packet (bytes).
 const MAX_PADDING: usize = 512;
 
+/// Padding cap for the tunnel data path. Large padding adds ~18% overhead on
+/// full-size packets and was a measurable throughput cost.
+const DATA_PATH_MAX_PADDING: usize = 16;
+
 /// Jitter parameters (milliseconds).
 const JITTER_MEAN_MS: f64 = 2.0;
 const JITTER_STDDEV_MS: f64 = 4.0;
@@ -35,7 +39,17 @@ impl ObfsEngine {
     ///
     /// Layout: `[ pad_len : u16 LE | original data | random padding ]`
     pub fn pad_packet(&mut self, data: Vec<u8>) -> Vec<u8> {
-        let pad_len: usize = self.rng.gen_range(0..=MAX_PADDING);
+        self.pad_packet_max(data, MAX_PADDING)
+    }
+
+    /// Like `pad_packet` but with a small padding cap suited to high-volume
+    /// tunnel data (see `DATA_PATH_MAX_PADDING`).
+    pub fn pad_data_packet(&mut self, data: Vec<u8>) -> Vec<u8> {
+        self.pad_packet_max(data, DATA_PATH_MAX_PADDING)
+    }
+
+    fn pad_packet_max(&mut self, data: Vec<u8>, max_pad: usize) -> Vec<u8> {
+        let pad_len: usize = self.rng.gen_range(0..=max_pad);
         let mut out = Vec::with_capacity(2 + data.len() + pad_len);
 
         // 2-byte length prefix.

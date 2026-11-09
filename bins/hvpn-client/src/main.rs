@@ -506,6 +506,9 @@ pub async fn run_client(config_path: &str, shutdown: CancellationToken) -> Resul
         match WinTunDevice::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address).await {
             Ok(dev) => {
                 info!("WinTun device opened successfully");
+                if let Err(e) = dev.set_mtu(1380) {
+                    tracing::warn!("failed to set TUN MTU: {}", e);
+                }
                 // Wait for the WinTun adapter to fully initialise before touching the routing table.
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

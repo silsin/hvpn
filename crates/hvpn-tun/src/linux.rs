@@ -4,9 +4,8 @@
 use async_trait::async_trait;
 use hvpn_common::HvpnError;
 use std::fs::OpenOptions;
-use std::os::unix::io::{AsRawFd, RawFd};
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use tokio::io::unix::AsyncFd;
 
 use crate::tun_trait::TunDevice;
 
@@ -24,8 +23,12 @@ struct Ifreq {
 }
 
 /// Linux TUN device backed by `/dev/net/tun`.
+///
+/// The fd is non-blocking and driven by the reactor (`AsyncFd`), so reads and
+/// writes take `&self` and can run concurrently on a shared `Arc<LinuxTun>`
+/// without any lock (a read never blocks a write).
 pub struct LinuxTun {
-    file: File,
+    fd: AsyncFd<OwnedFd>,
     /// Actual kernel interface name, e.g. `"hvpn0"`.
     ifname: String,
 }
@@ -35,11 +38,9 @@ impl LinuxTun {
     /// The fd must already be configured with TUNSETIFF.
     /// Used by the server to reuse the fd opened by `setup_nat`.
     pub fn from_raw_fd(fd: RawFd, ifname: &str) -> Result<Self, HvpnError> {
-        use std::os::unix::io::FromRawFd;
-        let std_file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let async_file = File::from_std(std_file);
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(Self {
-            file: async_file,
+            fd: make_async_fd(owned)?,
             ifname: ifname.to_string(),
         })
     }
@@ -90,11 +91,9 @@ impl LinuxTun {
         .unwrap_or("unknown")
         .to_string();
 
-        // Convert to async Tokio file.
-        let async_file = File::from_std(file);
-
+        // Convert to a non-blocking, reactor-driven fd.
         let tun = Self {
-            file: async_file,
+            fd: make_async_fd(OwnedFd::from(file))?,
             ifname,
         };
 
@@ -135,6 +134,61 @@ impl LinuxTun {
         Ok(())
     }
 
+    /// Read one IP packet. Takes `&self`; safe to call concurrently with
+    /// `write_shared` on the same device.
+    pub async fn read_shared(&self) -> Result<Vec<u8>, HvpnError> {
+        // TUN MTU is <= 1500 in practice; 4 KiB leaves ample headroom and
+        // avoids zeroing/allocating 64 KiB per packet.
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut guard = self
+                .fd
+                .readable()
+                .await
+                .map_err(|e| HvpnError::Tun(e.to_string()))?;
+            match guard.try_io(|inner| {
+                let n = unsafe {
+                    libc::read(inner.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(n)) => return Ok(buf[..n].to_vec()),
+                Ok(Err(e)) => return Err(HvpnError::Tun(e.to_string())),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// Write one IP packet. Takes `&self`; safe to call concurrently with
+    /// `read_shared` on the same device.
+    pub async fn write_shared(&self, pkt: &[u8]) -> Result<(), HvpnError> {
+        loop {
+            let mut guard = self
+                .fd
+                .writable()
+                .await
+                .map_err(|e| HvpnError::Tun(e.to_string()))?;
+            match guard.try_io(|inner| {
+                let n = unsafe {
+                    libc::write(inner.as_raw_fd(), pkt.as_ptr() as *const libc::c_void, pkt.len())
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) => return Err(HvpnError::Tun(e.to_string())),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
     /// Set the MTU of the TUN interface.
     pub fn set_mtu(&self, mtu: u32) -> Result<(), HvpnError> {
         run_cmd(
@@ -145,6 +199,22 @@ impl LinuxTun {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Put `fd` in non-blocking mode and register it with the tokio reactor.
+/// Must be called from within a tokio runtime.
+fn make_async_fd(fd: OwnedFd) -> Result<AsyncFd<OwnedFd>, HvpnError> {
+    let raw = fd.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(HvpnError::Tun(format!(
+                "set O_NONBLOCK: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    AsyncFd::new(fd).map_err(|e| HvpnError::Tun(format!("register tun fd: {}", e)))
+}
 
 /// Run an external command and return an error if it exits non-zero.
 fn run_cmd(prog: &str, args: &[&str]) -> Result<(), HvpnError> {
@@ -210,20 +280,10 @@ unsafe fn libc_ioctl(fd: RawFd, request: u64, arg: u64) -> i64 {
 #[async_trait]
 impl TunDevice for LinuxTun {
     async fn read_packet(&mut self) -> Result<Vec<u8>, HvpnError> {
-        let mut buf = vec![0u8; 65535];
-        let n = self
-            .file
-            .read(&mut buf)
-            .await
-            .map_err(|e| HvpnError::Tun(e.to_string()))?;
-        buf.truncate(n);
-        Ok(buf)
+        self.read_shared().await
     }
 
     async fn write_packet(&mut self, pkt: &[u8]) -> Result<(), HvpnError> {
-        self.file
-            .write_all(pkt)
-            .await
-            .map_err(|e| HvpnError::Tun(e.to_string()))
+        self.write_shared(pkt).await
     }
 }

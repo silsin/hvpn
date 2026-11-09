@@ -63,7 +63,7 @@ struct ServerState {
     nat_router: Option<Arc<nat::NatRouter>>,
     /// Shared TUN device for NAT forwarding (Linux only).
     #[cfg(target_os = "linux")]
-    shared_tun: Option<Arc<tokio::sync::Mutex<hvpn_tun::LinuxTun>>>,
+    shared_tun: Option<Arc<hvpn_tun::LinuxTun>>,
 }
 
 // ── TLS cert helpers ──────────────────────────────────────────────────────────
@@ -277,7 +277,7 @@ async fn main() -> Result<()> {
                 info!("shared TUN device ready for NAT forwarding");
                 (
                     Some(Arc::new(nat::NatRouter::new())),
-                    Some(Arc::new(tokio::sync::Mutex::new(tun))),
+                    Some(Arc::new(tun)),
                 )
             }
             Err(e) => {
@@ -363,6 +363,7 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         info!(%peer_addr, "accepted TCP connection");
 
         // ── Port-knock enforcement ─────────────────────────────────────────
@@ -763,7 +764,7 @@ where
             let shared_tun_for_read = Arc::clone(&shared_tun);
             let _read_sub: tokio::task::JoinHandle<()> = tokio::spawn(async move {
                 loop {
-                    let result = shared_tun_for_read.lock().await.read_packet().await;
+                    let result = shared_tun_for_read.read_shared().await;
                     if tun_read_tx.send(result).await.is_err() {
                         break; // outer loop dropped its receiver
                     }
@@ -776,7 +777,7 @@ where
                     pkt = write_rx.recv() => {
                         match pkt {
                             Some(p) => {
-                                if let Err(e) = shared_tun.lock().await.write_packet(&p).await {
+                                if let Err(e) = shared_tun.write_shared(&p).await {
                                     warn!(peer = %peer_tun, "TUN write: {}", e);
                                     break;
                                 }
@@ -824,7 +825,7 @@ where
                             padding: vec![],
                         };
                         let encoded = codec_a.encode(&frame);
-                        let padded = obfs_a.pad_packet(encoded);
+                        let padded = obfs_a.pad_data_packet(encoded);
                         if sink.send(Message::Binary(padded)).await.is_err() { break; }
                         out_seq = out_seq.wrapping_add(1);
                     }

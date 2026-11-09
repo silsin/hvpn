@@ -93,6 +93,16 @@ mod linux_nat {
         )?;
         info!("iptables NAT masquerade rule installed (10.8.0.0/24)");
 
+        // Clamp TCP MSS on forwarded SYNs so inner TCP never builds packets
+        // larger than the tunnel MTU (best effort).
+        if let Err(e) = run_cmd(
+            "iptables",
+            &["-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+              "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+        ) {
+            tracing::warn!("MSS clamp rule not installed: {}", e);
+        }
+
         Ok(fd)
     }
 
@@ -144,6 +154,10 @@ mod linux_nat {
             format!("{}/24", tun_ip)
         };
         run_cmd("ip", &["addr", "add", &cidr, "dev", iface_name])
+            .map_err(|e| e.to_string())?;
+        // MTU below 1500 leaves room for AEAD tag + frame header + WS/TLS/TCP
+        // overhead so outer segments don't split awkwardly.
+        run_cmd("ip", &["link", "set", iface_name, "mtu", "1380"])
             .map_err(|e| e.to_string())?;
         run_cmd("ip", &["link", "set", iface_name, "up"])
             .map_err(|e| e.to_string())?;
