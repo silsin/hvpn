@@ -2,6 +2,7 @@ mod transport_trait;
 mod websocket;
 mod http2;
 mod grpc;
+mod quic;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,11 @@ pub use transport_trait::Transport;
 pub use websocket::{CertVerifier, DangerVerifier, TransportConfig, WebSocketTransport};
 pub use http2::Http2Transport;
 pub use grpc::GrpcTransport;
+pub use quic::{
+    quic_server_endpoint, quic_transport_config, QuicTransport, QUIC_ALPN, QUIC_AUTH_MSG_LEN,
+    QUIC_HELLO_LEN, QUIC_TUNNEL_MTU,
+};
+pub use quinn;
 pub use hvpn_crypto::{build_tls_config_raw, TlsProfile, TlsProfileConfig};
 
 /// SHA-256 certificate fingerprint pin. When `sha256_fingerprints` is non-empty,

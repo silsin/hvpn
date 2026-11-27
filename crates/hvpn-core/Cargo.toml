@@ -9,3 +9,4 @@ hvpn-crypto = { path = "../hvpn-crypto" }
 tokio       = { workspace = true }
 bytes       = { workspace = true }
 thiserror   = { workspace = true }
+rand        = { workspace = true }

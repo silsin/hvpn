@@ -1655,6 +1655,7 @@ dependencies = [
  "bytes",
  "hvpn-common",
  "hvpn-crypto",
+ "rand 0.8.8",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -1744,6 +1745,7 @@ name = "hvpn-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "clap",
  "dashmap",
@@ -1758,6 +1760,7 @@ dependencies = [
  "hvpn-tun",
  "libc",
  "qrcode",
+ "quinn",
  "rand 0.8.8",
  "rcgen",
  "reqwest",
@@ -1801,6 +1804,8 @@ dependencies = [
  "hvpn-common",
  "hvpn-crypto",
  "hvpn-metrics",
+ "quinn",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "sha2",

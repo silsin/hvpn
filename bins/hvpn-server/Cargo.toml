@@ -34,9 +34,9 @@ rcgen          = "0.13.1"
 tokio-rustls   = "0.26.0"
 hmac           = { workspace = true }
 sha2           = { workspace = true }
-
-[dev-dependencies]
+async-trait    = { workspace = true }
 hvpn-transport = { path = "../../crates/hvpn-transport" }
+quinn          = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.153"

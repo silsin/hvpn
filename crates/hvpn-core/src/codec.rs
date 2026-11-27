@@ -50,7 +50,7 @@ pub struct Frame {
 }
 
 /// Fixed header size in bytes.
-const HEADER_SIZE: usize = 8 + 4 + 1 + 1 + 2 + 4; // 20
+pub const HEADER_SIZE: usize = 8 + 4 + 1 + 1 + 2 + 4; // 20
 
 /// Encodes and decodes `Frame` values to/from raw bytes.
 ///
@@ -90,6 +90,51 @@ impl FrameCodec {
         }
 
         buf
+    }
+
+    /// Append the masked 20-byte header to `out` (wire-identical to `encode`).
+    pub fn write_header(
+        &self,
+        out: &mut Vec<u8>,
+        seq: u64,
+        stream_id: u32,
+        frame_type: FrameType,
+        flags: u8,
+        pad_len: u16,
+        payload_len: u32,
+    ) {
+        let start = out.len();
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&stream_id.to_le_bytes());
+        out.push(frame_type as u8);
+        out.push(flags);
+        out.extend_from_slice(&pad_len.to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        let mask = self.header_key[0];
+        for b in out[start..].iter_mut() {
+            *b ^= mask;
+        }
+    }
+
+    /// Parse the header of `data` without copying the payload.
+    /// Returns `(seq, frame_type, pad_len, payload_len)` after bounds checks.
+    pub fn read_header(&self, data: &[u8]) -> Result<(u64, FrameType, usize, usize), HvpnError> {
+        if data.len() < HEADER_SIZE {
+            return Err(HvpnError::FrameCodec("buffer too short".into()));
+        }
+        let mask = self.header_key[0];
+        let mut h = [0u8; HEADER_SIZE];
+        for (d, s) in h.iter_mut().zip(&data[..HEADER_SIZE]) {
+            *d = *s ^ mask;
+        }
+        let seq = u64::from_le_bytes(h[0..8].try_into().unwrap());
+        let frame_type = FrameType::try_from(h[12])?;
+        let pad_len = u16::from_le_bytes(h[14..16].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(h[16..20].try_into().unwrap()) as usize;
+        if data.len() < HEADER_SIZE + payload_len + pad_len {
+            return Err(HvpnError::FrameCodec("buffer too short for payload+padding".into()));
+        }
+        Ok((seq, frame_type, pad_len, payload_len))
     }
 
     /// Decode a `Frame` from raw bytes.

@@ -1,5 +1,5 @@
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
 use hvpn_common::HvpnError;
@@ -72,6 +72,29 @@ pub fn decrypt_packet(
     let nonce = nonce_from_seq(seq_num);
     cipher
         .decrypt(&nonce, ciphertext)
+        .map_err(|e| HvpnError::Crypto(e.to_string()))
+}
+
+/// Encrypt `buf` in place with the session send key and return the 16-byte tag.
+/// Allocation-free counterpart of [`encrypt_packet`] for the data hot path.
+pub fn seal_in_place(keys: &SessionKeys, buf: &mut [u8], seq_num: u64) -> Result<[u8; 16], HvpnError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&keys.send_key));
+    let tag = cipher
+        .encrypt_in_place_detached(&nonce_from_seq(seq_num), b"", buf)
+        .map_err(|e| HvpnError::Crypto(e.to_string()))?;
+    Ok(tag.into())
+}
+
+/// Decrypt `buf` in place with the session recv key, verifying `tag`.
+pub fn open_in_place(
+    keys: &SessionKeys,
+    buf: &mut [u8],
+    tag: &[u8; 16],
+    seq_num: u64,
+) -> Result<(), HvpnError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&keys.recv_key));
+    cipher
+        .decrypt_in_place_detached(&nonce_from_seq(seq_num), b"", buf, chacha20poly1305::Tag::from_slice(tag))
         .map_err(|e| HvpnError::Crypto(e.to_string()))
 }
 

@@ -14,6 +14,7 @@ use hvpn_crypto::{generate_probe_token, perform_handshake_server, decrypt_packet
 use hvpn_obfs::ObfsEngine;
 
 mod nat;
+mod routing;
 
 /// HVPN server — accepts tunnelled connections from HVPN clients.
 #[derive(Parser, Debug)]
@@ -58,9 +59,11 @@ struct ServerState {
     auth_secret: Option<[u8; 32]>,
     /// Replay cache: maps 40-byte token → UNIX timestamp of first use.
     nonce_cache: Arc<DashMap<[u8; 40], u64>>,
-    /// Present only on Linux when `config.nat_enabled = true`.
+    /// Per-client VPN addresses and return-path routing.
+    router: Arc<routing::ClientRouter>,
+    /// True on Linux when `config.nat_enabled` and the NAT/TUN setup succeeded.
     #[cfg(target_os = "linux")]
-    nat_router: Option<Arc<nat::NatRouter>>,
+    nat_active: bool,
     /// Shared TUN device for NAT forwarding (Linux only).
     #[cfg(target_os = "linux")]
     shared_tun: Option<Arc<hvpn_tun::LinuxTun>>,
@@ -256,6 +259,7 @@ async fn main() -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     let (tls_cert_path, tls_key_path) = ("/etc/hvpn/server.pem", "/etc/hvpn/server.key");
 
+    let mut quic_tls_config: Option<Arc<rustls::ServerConfig>> = None;
     let tls_acceptor: Option<tokio_rustls::TlsAcceptor> =
         match ensure_tls_cert(tls_cert_path, tls_key_path) {
             Ok((cert_pem, key_pem)) => {
@@ -264,6 +268,7 @@ async fn main() -> Result<()> {
                 }
                 match build_rustls_server_config(&cert_pem, &key_pem) {
                     Ok(server_cfg) => {
+                        quic_tls_config = Some(server_cfg.clone());
                         info!("TLS enabled — connections will use wss://");
                         Some(tokio_rustls::TlsAcceptor::from(server_cfg))
                     }
@@ -281,25 +286,22 @@ async fn main() -> Result<()> {
 
     // ── NAT routing setup + shared TUN (Linux only) ──────────────────────
     #[cfg(target_os = "linux")]
-    let (nat_router, shared_tun) = if cfg.nat_enabled {
+    let (nat_active, shared_tun) = if cfg.nat_enabled {
         match nat::setup_nat("10.8.0.1") {
             Ok(tun_fd) => {
                 info!("NAT routing enabled");
                 let tun = hvpn_tun::LinuxTun::from_raw_fd(tun_fd, "hvpn0")
                     .expect("failed to wrap TUN fd");
                 info!("shared TUN device ready for NAT forwarding");
-                (
-                    Some(Arc::new(nat::NatRouter::new())),
-                    Some(Arc::new(tun)),
-                )
+                (true, Some(Arc::new(tun)))
             }
             Err(e) => {
                 warn!("NAT setup failed: {} — NAT disabled", e);
-                (None, None)
+                (false, None)
             }
         }
     } else {
-        (None, None)
+        (false, None)
     };
 
     // Nonce / replay cache: maps 40-byte token → UNIX timestamp of first use.
@@ -310,11 +312,30 @@ async fn main() -> Result<()> {
         mac_key,
         auth_secret,
         nonce_cache,
+        router: Arc::new(routing::ClientRouter::new()),
         #[cfg(target_os = "linux")]
-        nat_router,
+        nat_active,
         #[cfg(target_os = "linux")]
         shared_tun,
     });
+
+    // One reader for the shared TUN device: routes each returning packet to
+    // the client that owns its destination address (multi-client support).
+    #[cfg(target_os = "linux")]
+    if let Some(tun) = state.shared_tun.as_ref().map(Arc::clone) {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match tun.read_shared().await {
+                    Ok(pkt) => { st.router.dispatch(pkt); }
+                    Err(e) => {
+                        warn!("shared TUN read error: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+    }
 
     // ── Audit logger ──────────────────────────────────────────────────────
     let audit_log_path = std::env::var("HVPN_AUDIT_LOG").ok();
@@ -368,6 +389,34 @@ async fn main() -> Result<()> {
             Err(e) => {
                 warn!("could not bind knock port (non-fatal): {}", e);
             }
+        }
+    }
+
+    // ── QUIC listener (UDP, same port) ─────────────────────────────────────
+    // Packets ride QUIC datagrams: no TCP-over-TCP, so far better throughput
+    // on lossy or long-distance links. The WebSocket listener stays as fallback.
+    if let Some(tls_cfg) = quic_tls_config.as_ref() {
+        match hvpn_transport::quic_server_endpoint(
+            format!("0.0.0.0:{}", cfg.server_port).parse()?,
+            tls_cfg,
+        ) {
+            Ok(endpoint) => {
+                info!(port = cfg.server_port, "QUIC listener started (UDP)");
+                let state_q = state.clone();
+                let audit_q = audit.clone();
+                tokio::spawn(async move {
+                    while let Some(incoming) = endpoint.accept().await {
+                        let st = state_q.clone();
+                        let au = audit_q.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection_quic(incoming, st, au).await {
+                                warn!(error = %e, "quic connection error");
+                            }
+                        });
+                    }
+                });
+            }
+            Err(e) => warn!("QUIC listener unavailable (WebSocket only): {}", e),
         }
     }
 
@@ -425,8 +474,6 @@ fn validate_auth_token(
     req: &tokio_tungstenite::tungstenite::handshake::server::Request,
     auth_secret: Option<[u8; 32]>,
 ) -> Result<[u8; 40], String> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
 
     let secret = match auth_secret {
         Some(s) => s,
@@ -455,6 +502,15 @@ fn validate_auth_token(
     let mut token_arr = [0u8; 40];
     token_arr.copy_from_slice(&token_bytes);
 
+    verify_token_bytes(&token_arr, &secret)?;
+    Ok(token_arr)
+}
+
+/// Check timestamp freshness and HMAC of a raw 40-byte auth token.
+fn verify_token_bytes(token_arr: &[u8; 40], secret: &[u8; 32]) -> Result<(), String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
     // Extract timestamp.
     let mut ts_bytes = [0u8; 8];
     ts_bytes.copy_from_slice(&token_arr[0..8]);
@@ -477,7 +533,7 @@ fn validate_auth_token(
     mac_input[..8].copy_from_slice(&ts_bytes);
     // bytes [8..24] stay zero (fixed nonce).
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(&secret)
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
         .expect("HMAC accepts any key length");
     mac.update(&mac_input);
     let received = &token_arr[8..40];
@@ -485,7 +541,91 @@ fn validate_auth_token(
         return Err("X-Auth-Token HMAC mismatch".to_string());
     }
 
-    Ok(token_arr)
+    Ok(())
+}
+
+// ── QUIC connection path ──────────────────────────────────────────────────────
+
+/// Authenticate a QUIC connection (token + client ephemeral key on the first
+/// bidirectional stream), then run the normal session over datagrams.
+async fn handle_connection_quic(
+    incoming: quinn::Incoming,
+    state: Arc<ServerState>,
+    audit: Arc<AuditLogger>,
+) -> Result<()> {
+    use std::time::Duration;
+
+    // Address validation (retry) stops spoofed-source amplification floods.
+    let incoming = if !incoming.remote_address_validated() && incoming.may_retry() {
+        incoming.retry()?;
+        return Ok(());
+    } else {
+        incoming
+    };
+    let peer_addr = incoming.remote_address();
+    let peer = peer_addr.to_string();
+    let conn = incoming.await?;
+
+    let reject = |why: &str| {
+        warn!(%peer, "quic connection rejected: {}", why);
+        audit.log(AuditEvent::HandshakeFailed {
+            peer_ip: peer_addr.ip().to_string(),
+            reason: format!("QUIC: {}", why),
+            timestamp: AuditLogger::current_timestamp(),
+        });
+        conn.close(1u32.into(), b"");
+    };
+
+    let (mut send, mut recv) = match tokio::time::timeout(Duration::from_secs(5), conn.accept_bi()).await {
+        Ok(Ok(s)) => s,
+        _ => { reject("no auth stream"); return Ok(()); }
+    };
+    let mut msg = [0u8; hvpn_transport::QUIC_AUTH_MSG_LEN];
+    match tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut msg)).await {
+        Ok(Ok(())) => {}
+        _ => { reject("short auth message"); return Ok(()); }
+    }
+
+    let mut token = [0u8; 40];
+    token.copy_from_slice(&msg[..40]);
+    let secret = match state.auth_secret {
+        Some(s) => s,
+        None => { reject("no auth secret configured"); return Ok(()); }
+    };
+    if let Err(e) = verify_token_bytes(&token, &secret) {
+        reject(&e);
+        return Ok(());
+    }
+    let now = current_timestamp_secs();
+    state.nonce_cache.retain(|_, &mut ts| now.saturating_sub(ts) <= 60);
+    if state.nonce_cache.contains_key(&token) {
+        reject("replayed token");
+        return Ok(());
+    }
+    state.nonce_cache.insert(token, now);
+
+    let mut ephemeral = [0u8; 32];
+    ephemeral.copy_from_slice(&msg[40..]);
+
+    // Reply: 1 = ok, followed by the VPN address assigned to this client
+    // (0.0.0.0 when the server does no NAT and assigns nothing).
+    #[allow(unused_mut)]
+    let mut ack = [1u8, 0, 0, 0, 0];
+    #[cfg(target_os = "linux")]
+    if state.nat_active {
+        match state.router.assign(peer_addr) {
+            Some(ip) => ack[1..].copy_from_slice(&ip.octets()),
+            None => { reject("address pool exhausted"); return Ok(()); }
+        }
+    }
+    if send.write_all(&ack).await.is_err() {
+        state.router.release(&peer_addr);
+        return Ok(());
+    }
+
+    let wire = QuicWire { conn: conn.clone() };
+    let wire2 = QuicWire { conn };
+    run_session(Box::new(wire), Box::new(wire2), ephemeral, peer, peer_addr, state, audit, false).await
 }
 
 // ── TLS connection path ───────────────────────────────────────────────────────
@@ -680,6 +820,85 @@ async fn handle_connection_plain(
 // ── Shared authenticated session handler ─────────────────────────────────────
 
 #[allow(unused_variables)]
+/// Outbound half of a client connection (WebSocket message or QUIC datagram).
+#[async_trait::async_trait]
+trait WireTx: Send {
+    async fn send_pkt(&mut self, data: Vec<u8>) -> Result<()>;
+    async fn close_wire(&mut self);
+}
+
+/// Inbound half. `None` = connection closed.
+#[async_trait::async_trait]
+trait WireRx: Send {
+    async fn recv_pkt(&mut self) -> Option<Result<Vec<u8>>>;
+}
+
+#[async_trait::async_trait]
+impl<S> WireTx for futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<S>,
+    tokio_tungstenite::tungstenite::protocol::Message,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    async fn send_pkt(&mut self, data: Vec<u8>) -> Result<()> {
+        self.send(tokio_tungstenite::tungstenite::protocol::Message::Binary(data))
+            .await
+            .map_err(Into::into)
+    }
+    async fn close_wire(&mut self) {
+        let _ = self.close().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> WireRx for futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    async fn recv_pkt(&mut self) -> Option<Result<Vec<u8>>> {
+        use tokio_tungstenite::tungstenite::protocol::Message;
+        loop {
+            match self.next().await {
+                Some(Ok(Message::Binary(d))) => return Some(Ok(d)),
+                Some(Ok(Message::Close(_))) | None => return None,
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Some(Err(e.into())),
+            }
+        }
+    }
+}
+
+/// QUIC side: packets travel as unreliable datagrams (no TCP-over-TCP).
+struct QuicWire {
+    conn: quinn::Connection,
+}
+
+#[async_trait::async_trait]
+impl WireTx for QuicWire {
+    async fn send_pkt(&mut self, data: Vec<u8>) -> Result<()> {
+        match self.conn.send_datagram(data.into()) {
+            Ok(()) | Err(quinn::SendDatagramError::TooLarge) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+    async fn close_wire(&mut self) {
+        self.conn.close(0u32.into(), b"bye");
+    }
+}
+
+#[async_trait::async_trait]
+impl WireRx for QuicWire {
+    async fn recv_pkt(&mut self) -> Option<Result<Vec<u8>>> {
+        match self.conn.read_datagram().await {
+            Ok(b) => Some(Ok(b.to_vec())),
+            Err(quinn::ConnectionError::ApplicationClosed(_))
+            | Err(quinn::ConnectionError::LocallyClosed) => None,
+            Err(e) => Some(Err(e.into())),
+        }
+    }
+}
+
 async fn handle_authenticated<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     peer: String,
@@ -690,25 +909,39 @@ async fn handle_authenticated<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    use tokio_tungstenite::tungstenite::protocol::Message;
-
-    info!(%peer, "authenticated connection established");
-
-    let (mut sink, mut source) = ws_stream.split();
+    let (sink, mut source) = ws_stream.split();
 
     // First message: client's ephemeral X25519 public key (32 bytes).
-    let session_keys = match source.next().await {
-        Some(Ok(Message::Binary(data))) if data.len() >= 32 => {
-            let mut ephemeral = [0u8; 32];
-            ephemeral.copy_from_slice(&data[..32]);
-            perform_handshake_server(&ephemeral, &state.server_secret)
-                .map_err(|e| anyhow::anyhow!("handshake error: {}", e))?
+    let ephemeral = match source.recv_pkt().await {
+        Some(Ok(data)) if data.len() >= 32 => {
+            let mut e = [0u8; 32];
+            e.copy_from_slice(&data[..32]);
+            e
         }
         other => {
-            warn!(%peer, "unexpected first message: {:?}", other);
+            warn!(%peer, "unexpected first message: {:?}", other.map(|r| r.map(|d| d.len())));
             return Ok(());
         }
     };
+    run_session(Box::new(sink), Box::new(source), ephemeral, peer, peer_addr, state, audit, true).await
+}
+
+/// Transport-independent session: handshake, then pump packets between the
+/// wire and the TUN device.
+async fn run_session(
+    mut sink: Box<dyn WireTx>,
+    mut source: Box<dyn WireRx>,
+    ephemeral: [u8; 32],
+    peer: String,
+    peer_addr: std::net::SocketAddr,
+    state: Arc<ServerState>,
+    audit: Arc<AuditLogger>,
+    announce_ip: bool,
+) -> Result<()> {
+    info!(%peer, "authenticated connection established");
+
+    let session_keys = perform_handshake_server(&ephemeral, &state.server_secret)
+        .map_err(|e| anyhow::anyhow!("handshake error: {}", e))?;
 
     info!(%peer, "crypto handshake complete");
 
@@ -724,122 +957,65 @@ where
 
     // ── NAT routing path (Linux only) ─────────────────────────────────────
     #[cfg(target_os = "linux")]
-    if let Some(router) = state.nat_router.as_ref().map(Arc::clone) {
-        use hvpn_core::Frame;
-        use hvpn_core::FrameType;
-        use hvpn_tun::TunDevice;
-
-        // Assign this client a VPN IP.
-        let _client_ip = router.assign_client_ip(peer_addr);
-
-        // Use the shared TUN device for reading (server→client direction).
+    if state.nat_active {
+        // Use the shared TUN device (writes only; one global task reads it).
         let shared_tun = match state.shared_tun.as_ref() {
             Some(t) => Arc::clone(t),
             None => {
-                warn!(%peer, "shared TUN not available — falling back to log loop");
-                drop(router);
+                warn!(%peer, "shared TUN not available — closing");
                 return Ok(());
             }
         };
+        let client_ip = match state.router.assign(peer_addr) {
+            Some(ip) => ip,
+            None => {
+                warn!(%peer, "VPN address pool exhausted — rejecting client");
+                return Ok(());
+            }
+        };
+        info!(%peer, %client_ip, "client address assigned");
+
+        // WebSocket clients learn their address from the first message;
+        // QUIC clients already got it in the authentication reply.
+        if announce_ip {
+            let mut msg = routing::ASSIGN_MAGIC.to_vec();
+            msg.extend_from_slice(&client_ip.octets());
+            if sink.send_pkt(msg).await.is_err() {
+                state.router.release(&peer_addr);
+                return Ok(());
+            }
+        }
 
         let keys_a = session_keys.clone();
         let keys_b = session_keys.clone();
         let peer_a = peer.clone();
         let peer_b = peer.clone();
         let peer_tun = peer.clone();
-        let router_b = router.clone();
-        let client_addr = peer_addr;
 
-        // Channels: write_tx/write_rx — client→TUN; read_tx/read_rx — TUN→client.
-        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
-        let (read_tx, mut read_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        // read: TUN to client (fed by the global TUN reader via the router)
+        // write: client to TUN
+        let (read_tx, mut read_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        state.router.register(client_ip, read_tx);
 
-        // Single TUN I/O task: owns shared_tun, multiplexes reads and writes.
-        //
-        // Design: a dedicated inner read sub-task runs continuously and is
-        // never cancelled — it holds the TUN lock only for the duration of
-        // each read_packet() call, then sends the result on an internal mpsc.
-        // This means:
-        //   • TUN reads are never silently abandoned mid-flight (fixing the
-        //     "dropped async move future" packet-loss path).
-        //   • Writes and reads progress concurrently; the outer loop's
-        //     non-biased select! ensures completed reads are forwarded
-        //     promptly even when writes are also available, preventing
-        //     write-starvation of the server→client path.
-        let tun_io: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-            // Internal channel: read sub-task → outer loop.
-            let (tun_read_tx, mut tun_read_rx) =
-                tokio::sync::mpsc::channel::<Result<Vec<u8>, hvpn_common::HvpnError>>(512);
-
-            // Dedicated read sub-task: loops forever reading from TUN and
-            // forwarding completed packets. This future is never dropped
-            // mid-read, so kernel-delivered data is never discarded.
-            let shared_tun_for_read = Arc::clone(&shared_tun);
-            let _read_sub: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-                loop {
-                    let result = shared_tun_for_read.read_shared().await;
-                    if tun_read_tx.send(result).await.is_err() {
-                        break; // outer loop dropped its receiver
-                    }
-                }
-            });
-
-            loop {
-                tokio::select! {
-                    // Write arm: forward a client→TUN packet.
-                    pkt = write_rx.recv() => {
-                        match pkt {
-                            Some(p) => {
-                                if let Err(e) = shared_tun.write_shared(&p).await {
-                                    warn!(peer = %peer_tun, "TUN write: {}", e);
-                                    break;
-                                }
-                            }
-                            None => break, // write channel closed
-                        }
-                    }
-                    // Read arm: forward a completed TUN read to Task A.
-                    read_result = tun_read_rx.recv() => {
-                        match read_result {
-                            Some(Ok(p)) => {
-                                if read_tx.send(p).await.is_err() {
-                                    break; // Task A dropped its receiver
-                                }
-                            }
-                            Some(Err(e)) => {
-                                warn!(peer = %peer_tun, "TUN read: {}", e);
-                                break;
-                            }
-                            None => break, // read sub-task exited
-                        }
-                    }
+        let tun_writer = tokio::spawn(async move {
+            while let Some(p) = write_rx.recv().await {
+                if let Err(e) = shared_tun.write_shared(&p).await {
+                    warn!(peer = %peer_tun, "TUN write: {}", e);
+                    break;
                 }
             }
         });
 
-        // Task A: TUN→client WS (server send direction)
+        // Task A: TUN to client (server send direction)
         let tun_to_client = tokio::spawn(async move {
             let codec_a = FrameCodec::new(keys_a.header_key);
-            let mut obfs_a = ObfsEngine::new();
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
             let mut out_seq: u64 = 0;
-            loop {
-                let ip_pkt = match read_rx.recv().await {
-                    Some(p) => p,
-                    None => break, // TUN I/O task closed
-                };
-                match hvpn_crypto::encrypt_packet(&keys_a, &ip_pkt, out_seq, None) {
-                    Ok(ciphertext) => {
-                        let frame = Frame {
-                            seq: out_seq,
-                            stream_id: 0,
-                            frame_type: FrameType::Data,
-                            flags: 0,
-                            payload: ciphertext,
-                            padding: vec![],
-                        };
-                        let encoded = codec_a.encode(&frame);
-                        let padded = obfs_a.pad_data_packet(encoded);
-                        if sink.send(Message::Binary(padded)).await.is_err() { break; }
+            while let Some(ip_pkt) = read_rx.recv().await {
+                match hvpn_core::seal_data_packet(&keys_a, &codec_a, &mut rng, out_seq, &ip_pkt, 16) {
+                    Ok(wire) => {
+                        if sink.send_pkt(wire).await.is_err() { break; }
                         out_seq = out_seq.wrapping_add(1);
                     }
                     Err(e) => warn!(peer = %peer_a, "encrypt: {}", e),
@@ -847,46 +1023,35 @@ where
             }
         });
 
-        // Task B: client WS → TUN (client→internet direction)
+        // Task B: client to TUN (client to internet direction)
         let client_to_tun = tokio::spawn(async move {
             let codec_b = FrameCodec::new(keys_b.header_key);
-            let obfs_b = ObfsEngine::new();
             let mut replay = hvpn_core::ReplayWindow::new();
-            while let Some(msg) = source.next().await {
+            while let Some(msg) = source.recv_pkt().await {
                 match msg {
-                    Ok(Message::Binary(data)) => {
-                        let unpadded = obfs_b.unpad_packet(data);
-                        match codec_b.decode(&unpadded) {
-                            Ok(frame) => {
-                                if replay.check_and_advance(frame.seq).is_err() { continue; }
-                                match hvpn_crypto::decrypt_packet(&keys_b, &frame.payload, frame.seq, None) {
-                                    Ok(ip_pkt) => {
-                                        if let Err(e) = write_tx.send(ip_pkt).await
-                                            .map_err(|e| hvpn_common::HvpnError::Tun(e.to_string()))
-                                        {
-                                            warn!(peer = %peer_b, "TUN channel send: {}", e);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => warn!(peer = %peer_b, "decrypt: {}", e),
-                                }
+                    Ok(data) => {
+                        // Malformed, forged, replayed or non-data packets are dropped.
+                        if let Ok(ip_pkt) = hvpn_core::open_data_packet(&keys_b, &codec_b, &data, &mut replay) {
+                            // Anti-spoofing: only the assigned source address is allowed.
+                            if routing::ipv4_src(&ip_pkt) != Some(client_ip) { continue; }
+                            if write_tx.send(ip_pkt).await.is_err() {
+                                warn!(peer = %peer_b, "TUN channel closed");
+                                break;
                             }
-                            Err(e) => warn!(peer = %peer_b, "frame decode: {}", e),
                         }
                     }
-                    Ok(Message::Close(_)) => { info!(peer = %peer_b, "client closed"); break; }
-                    Ok(_) => {}
-                    Err(e) => { warn!(peer = %peer_b, "ws error: {}", e); break; }
+                    Err(e) => { warn!(peer = %peer_b, "wire error: {}", e); break; }
                 }
             }
-            router_b.release_client_ip(&client_addr);
+            info!(peer = %peer_b, "client closed");
         });
 
         tokio::select! {
             _ = tun_to_client => {}
             _ = client_to_tun => {}
         }
-        tun_io.abort();
+        tun_writer.abort();
+        state.router.release(&peer_addr);
         info!(%peer, "NAT connection closed");
         audit.log(AuditEvent::ClientDisconnected {
             peer_ip: peer_addr.ip().to_string(),
@@ -901,9 +1066,9 @@ where
     let obfs = ObfsEngine::new();
     let mut replay = hvpn_core::ReplayWindow::new();
 
-    while let Some(msg) = source.next().await {
+    while let Some(msg) = source.recv_pkt().await {
         match msg {
-            Ok(Message::Binary(data)) => {
+            Ok(data) => {
                 let unpadded = obfs.unpad_packet(data);
                 match codec.decode(&unpadded) {
                     Ok(frame) => {
@@ -927,19 +1092,14 @@ where
                     Err(e) => warn!(%peer, "frame decode error: {}", e),
                 }
             }
-            Ok(Message::Close(_)) => {
-                info!(%peer, "client closed connection");
-                break;
-            }
-            Ok(_) => {}
             Err(e) => {
-                warn!(%peer, "ws error: {}", e);
+                warn!(%peer, "wire error: {}", e);
                 break;
             }
         }
     }
 
-    let _ = sink.close().await;
+    sink.close_wire().await;
     info!(%peer, "connection closed");
     audit.log(AuditEvent::ClientDisconnected {
         peer_ip: peer_addr.ip().to_string(),

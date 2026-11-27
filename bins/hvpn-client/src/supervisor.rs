@@ -22,7 +22,9 @@ use hvpn_common::{find_profile, load_active_profile, load_profiles, Config, Conn
 use hvpn_core::FrameCodec;
 use hvpn_crypto::perform_handshake_client;
 use hvpn_obfs::ObfsEngine;
-use hvpn_transport::{CertPin, Transport, TransportConfig, WebSocketTransport};
+use hvpn_transport::{
+    CertPin, QuicTransport, Transport, TransportConfig, WebSocketTransport, QUIC_TUNNEL_MTU,
+};
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use hvpn_tun::StubTun;
 use hvpn_tun::TunDevice;
@@ -33,6 +35,8 @@ use crate::{tunnel_loop, AppState, Phase};
 const TUNNEL_GATEWAY: &str = "10.8.0.1";
 /// How long to wait for the transport (TCP + TLS + WebSocket upgrade).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for QUIC before falling back to WebSocket.
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// A session that lasted this long counts as "was working": backoff resets.
 const STABLE_AFTER: Duration = Duration::from_secs(10);
 const BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 15, 30];
@@ -469,28 +473,72 @@ async fn run_session(
     }
 
     // 3. Connect the transport (before touching routes or DNS).
-    let connect = async {
-        if use_tls {
-            WebSocketTransport::connect(&tc).await
-        } else {
-            WebSocketTransport::connect_plain(&tc).await
+    // Preferred: QUIC datagrams (UDP) — no TCP-over-TCP, much faster on lossy
+    // or long links. Fallback: WebSocket over TLS (works where UDP is blocked).
+    // `HVPN_TRANSPORT=ws` or `=quic` forces one of them.
+    let forced = std::env::var("HVPN_TRANSPORT").unwrap_or_default().to_lowercase();
+    let mut transport: Option<Arc<dyn Transport>> = None;
+    // VPN address the server assigned to us (multi-client); None = use config.
+    let mut assigned_ip: Option<std::net::Ipv4Addr> = None;
+    if forced != "ws" && tc.auth_secret.is_some() {
+        let quic = tokio::select! {
+            _ = cancel.cancelled() => return Ok(SessionEnd::Cancelled),
+            r = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, QuicTransport::connect(&tc, &ephemeral_pub)) => r,
+        };
+        match quic {
+            Ok(Ok(t)) => {
+                info!("transport connected (QUIC/UDP)");
+                assigned_ip = t.assigned_ip();
+                transport = Some(Arc::new(t));
+            }
+            Ok(Err(e)) => warn!("QUIC unavailable ({}); falling back to WebSocket", e),
+            Err(_) => warn!("QUIC timed out (UDP blocked?); falling back to WebSocket"),
         }
-    };
-    let transport = tokio::select! {
-        _ = cancel.cancelled() => return Ok(SessionEnd::Cancelled),
-        r = tokio::time::timeout(CONNECT_TIMEOUT, connect) => match r {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => return Err(friendly_connect_error(&e.to_string())),
-            Err(_) => return Err(SessionError::transient("The server didn't respond in time.")),
+        if transport.is_none() && forced == "quic" {
+            return Err(SessionError::transient("QUIC connection failed."));
         }
-    };
-    info!("transport connected");
-    if let Err(e) = transport.send(ephemeral_pub.to_vec()).await {
-        return Err(SessionError::transient(format!("Lost connection while connecting: {e}")));
     }
+    let transport: Arc<dyn Transport> = match transport {
+        Some(t) => t,
+        None => {
+            let connect = async {
+                if use_tls {
+                    WebSocketTransport::connect(&tc).await
+                } else {
+                    WebSocketTransport::connect_plain(&tc).await
+                }
+            };
+            let ws = tokio::select! {
+                _ = cancel.cancelled() => return Ok(SessionEnd::Cancelled),
+                r = tokio::time::timeout(CONNECT_TIMEOUT, connect) => match r {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        // Keep the technical detail in the log for bug reports.
+                        warn!("transport connect failed: {}", e);
+                        return Err(friendly_connect_error(&e.to_string()));
+                    }
+                    Err(_) => return Err(SessionError::transient("The server didn't respond in time.")),
+                }
+            };
+            info!("transport connected (WebSocket/TLS)");
+            if let Err(e) = ws.send(ephemeral_pub.to_vec()).await {
+                return Err(SessionError::transient(format!("Lost connection while connecting: {e}")));
+            }
+            // New servers announce our VPN address first; old servers send
+            // nothing, so wait only briefly and fall back to the config value.
+            if let Ok(Ok(msg)) = tokio::time::timeout(Duration::from_secs(2), ws.recv()).await {
+                if msg.len() == 8 && &msg[..4] == b"HVIP" {
+                    assigned_ip = Some(std::net::Ipv4Addr::new(msg[4], msg[5], msg[6], msg[7]));
+                }
+            }
+            Arc::new(ws)
+        }
+    };
+    let tun_ip = assigned_ip.map(|ip| ip.to_string()).unwrap_or_else(|| cfg.tun_ip.clone());
+    info!(%tun_ip, "using tunnel address");
 
     // 4. Network adapter + routes (only now that the server is reachable).
-    let mut tun = match open_tun(cfg).await {
+    let mut tun = match open_tun(cfg, &tun_ip).await {
         Ok(t) => t,
         Err(msg) => {
             let _ = transport.close().await;
@@ -511,7 +559,7 @@ async fn run_session(
         _ = cancel.cancelled() => None,
         r = tunnel_loop(
             &mut tun,
-            Some(&transport),
+            Some(Arc::clone(&transport)),
             &codec,
             &mut obfs,
             &mut seq,
@@ -537,17 +585,17 @@ async fn run_session(
 // ── Network adapter ───────────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-async fn open_tun(cfg: &Config) -> Result<Box<dyn TunDevice>, String> {
+async fn open_tun(cfg: &Config, tun_ip: &str) -> Result<Box<dyn TunDevice>, String> {
     use hvpn_tun::WinTunDevice;
 
-    let dev = WinTunDevice::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address)
+    let dev = WinTunDevice::open("hvpn0", &format!("{}/24", tun_ip), &cfg.server_address)
         .await
         .map_err(|e| {
             warn!("WinTun open failed: {}", e);
             "Couldn't create the network adapter. Run HVPN as administrator.".to_string()
         })?;
     info!("WinTun device opened successfully");
-    if let Err(e) = dev.set_mtu(1380) {
+    if let Err(e) = dev.set_mtu(QUIC_TUNNEL_MTU) {
         warn!("failed to set TUN MTU: {}", e);
     }
     // Wait for the adapter to fully initialise before touching the routing table.
@@ -584,20 +632,23 @@ async fn open_tun(cfg: &Config) -> Result<Box<dyn TunDevice>, String> {
 }
 
 #[cfg(target_os = "linux")]
-async fn open_tun(cfg: &Config) -> Result<Box<dyn TunDevice>, String> {
+async fn open_tun(cfg: &Config, tun_ip: &str) -> Result<Box<dyn TunDevice>, String> {
     use hvpn_tun::LinuxTun;
-    let dev = LinuxTun::open("hvpn0", &format!("{}/24", cfg.tun_ip), &cfg.server_address)
+    let dev = LinuxTun::open("hvpn0", &format!("{}/24", tun_ip), &cfg.server_address)
         .await
         .map_err(|e| {
             warn!("TUN open failed: {}", e);
             "Couldn't create the network interface. Run as root (or grant CAP_NET_ADMIN).".to_string()
         })?;
     info!("Linux TUN device opened successfully");
+    if let Err(e) = dev.set_mtu(QUIC_TUNNEL_MTU) {
+        warn!("failed to set TUN MTU: {}", e);
+    }
     Ok(Box::new(dev))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-async fn open_tun(_cfg: &Config) -> Result<Box<dyn TunDevice>, String> {
+async fn open_tun(_cfg: &Config, _tun_ip: &str) -> Result<Box<dyn TunDevice>, String> {
     Ok(Box::new(StubTun::new()))
 }
 
@@ -770,7 +821,7 @@ mod tests {
         };
 
         // 1. Server unreachable: friendly message, automatic retry scheduled.
-        wait_for(&state, 8, "reconnecting with an error", |s| {
+        wait_for(&state, 20, "reconnecting with an error", |s| {
             s.phase == Phase::Reconnecting && s.last_error.is_some() && s.retry_at.is_some()
         })
         .await;
@@ -779,7 +830,7 @@ mod tests {
         assert!(!with_state(&state, |s| s.connected));
 
         // 2. A second attempt actually happens (backoff elapsed).
-        wait_for(&state, 8, "attempt 2", |s| s.attempt >= 2).await;
+        wait_for(&state, 30, "attempt 2", |s| s.attempt >= 2).await;
 
         // 3. Disconnect stops retrying and goes idle.
         let resp = crate::dispatch(&serde_json::json!({"cmd": "disconnect"}), &state);

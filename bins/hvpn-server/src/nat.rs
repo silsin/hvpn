@@ -6,7 +6,7 @@
 /// at the call sites.
 
 #[cfg(target_os = "linux")]
-pub use linux_nat::{NatRouter, setup_nat};
+pub use linux_nat::setup_nat;
 
 #[cfg(target_os = "linux")]
 mod linux_nat {
@@ -16,62 +16,6 @@ mod linux_nat {
 
     use hvpn_common::HvpnError;
     use tracing::{info, warn};
-
-    // ── IP pool ───────────────────────────────────────────────────────────────
-    // Client IPs are allocated from 10.8.0.2 upward; the server itself uses
-    // 10.8.0.1.  POOL_END is exclusive (10.8.0.255 is the broadcast address).
-
-    /// First IP to assign: 10.8.0.2
-    const POOL_START: u32 = (10 << 24) | (8 << 16) | 2;
-    /// Exclusive upper bound: 10.8.0.255
-    const POOL_END: u32 = (10 << 24) | (8 << 16) | 255;
-
-    // ── NatRouter ─────────────────────────────────────────────────────────────
-
-    /// Tracks per-client IP assignments and the next free IP in the pool.
-    pub struct NatRouter {
-        /// Map from client socket address to assigned VPN IP.
-        pub client_ips: Arc<Mutex<HashMap<SocketAddr, Ipv4Addr>>>,
-        /// Next IP to hand out (stored as u32 for easy increment).
-        next_ip: Mutex<u32>,
-    }
-
-    impl NatRouter {
-        /// Create a new router with an empty client table.
-        pub fn new() -> Self {
-            Self {
-                client_ips: Arc::new(Mutex::new(HashMap::new())),
-                next_ip: Mutex::new(POOL_START),
-            }
-        }
-
-        /// Assign (or re-use) a VPN IP for `addr`.  Returns `None` if the pool
-        /// is exhausted.
-        pub fn assign_client_ip(&self, addr: SocketAddr) -> Option<Ipv4Addr> {
-            let mut map = self.client_ips.lock().unwrap();
-            if let Some(existing) = map.get(&addr) {
-                return Some(*existing);
-            }
-            let mut next = self.next_ip.lock().unwrap();
-            if *next >= POOL_END {
-                warn!("IP pool exhausted — cannot assign IP to {}", addr);
-                return None;
-            }
-            let ip = Ipv4Addr::from(*next);
-            *next += 1;
-            map.insert(addr, ip);
-            info!(client = %addr, assigned_ip = %ip, "assigned client IP");
-            Some(ip)
-        }
-
-        /// Release the IP held by `addr` when the client disconnects.
-        pub fn release_client_ip(&self, addr: &SocketAddr) {
-            let mut map = self.client_ips.lock().unwrap();
-            if let Some(ip) = map.remove(addr) {
-                info!(client = %addr, released_ip = %ip, "released client IP");
-            }
-        }
-    }
 
     // ── setup_nat ─────────────────────────────────────────────────────────────
 

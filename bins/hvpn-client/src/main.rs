@@ -20,10 +20,9 @@ mod supervisor;
 pub use supervisor::run_client;
 
 use hvpn_common::RelayHopConfig;
-use hvpn_core::{Frame, FrameCodec};
-use hvpn_crypto::encrypt_packet;
+use hvpn_core::FrameCodec;
 use hvpn_obfs::ObfsEngine;
-use hvpn_transport::{Transport, WebSocketTransport};
+use hvpn_transport::Transport;
 use hvpn_tun::TunDevice;
 
 /// HVPN client — connects to an HVPN server and tunnels IP traffic.
@@ -615,19 +614,18 @@ async fn main() -> Result<()> {
 
 async fn tunnel_loop(
     tun: &mut Box<dyn TunDevice>,
-    transport: Option<&WebSocketTransport>,
+    transport: Option<Arc<dyn Transport>>,
     codec: &FrameCodec,
-    obfs: &mut ObfsEngine,
+    _obfs: &mut ObfsEngine,
     seq: &mut u64,
     keys: &hvpn_crypto::SessionKeys,
     state: Arc<Mutex<AppState>>,
 ) -> Result<()> {
-    use hvpn_core::{FrameType, ReplayWindow};
-    use hvpn_crypto::decrypt_packet;
-    use rand::{Rng, SeedableRng};
+    use hvpn_core::{open_data_packet, seal_data_packet};
+    use rand::SeedableRng;
 
     let transport = match transport {
-        Some(t) => t.clone(),
+        Some(t) => t,
         None => {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok(());
@@ -664,31 +662,15 @@ async fn tunnel_loop(
     // Spawn the server→TUN (download) task — runs independently for full duplex.
     let _inbound_task = AbortOnDrop(tokio::spawn(async move {
         let codec_in = FrameCodec::new(header_key);
-        let mut replay = ReplayWindow::new();
+        let mut replay = hvpn_core::ReplayWindow::new();
 
         loop {
             match transport_rx.recv().await {
                 Ok(data) => {
-                    // Unpad — read the 2-byte prefix, strip padding.
-                    let unpadded = if data.len() >= 2 {
-                        let pad_len = u16::from_le_bytes([data[0], data[1]]) as usize;
-                        let end = data.len().saturating_sub(pad_len);
-                        if end > 2 { data[2..end].to_vec() } else { continue; }
-                    } else { continue; };
-
-                    match codec_in.decode(&unpadded) {
-                        Ok(frame) => {
-                            if frame.frame_type != FrameType::Data { continue; }
-                            if replay.check_and_advance(frame.seq).is_err() { continue; }
-                            match decrypt_packet(&keys_clone, &frame.payload, frame.seq, None) {
-                                Ok(ip_pkt) => {
-                                    counters_in.bytes_in.fetch_add(ip_pkt.len() as u64, Relaxed);
-                                    if inbound_tx.send(ip_pkt).await.is_err() { break; }
-                                }
-                                Err(_) => continue,
-                            }
-                        }
-                        Err(_) => continue,
+                    // Single-buffer parse + in-place decrypt + replay check.
+                    if let Ok(ip_pkt) = open_data_packet(&keys_clone, &codec_in, &data, &mut replay) {
+                        counters_in.bytes_in.fetch_add(ip_pkt.len() as u64, Relaxed);
+                        if inbound_tx.send(ip_pkt).await.is_err() { break; }
                     }
                 }
                 Err(e) => {
@@ -699,6 +681,21 @@ async fn tunnel_loop(
         }
         // Dropping `inbound_tx` here tells the main loop the server is gone.
     }));
+
+    // Dedicated sender task: a slow/backpressured transport (WebSocket over a
+    // congested TCP link) must never stall TUN reads or writes. When the queue
+    // is full packets are dropped, exactly like an overloaded router.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2048);
+    let transport_tx = transport.clone();
+    let counters_send = Arc::clone(&counters_out);
+    let sender_task = tokio::spawn(async move {
+        while let Some(pkt) = out_rx.recv().await {
+            let len = pkt.len() as u64;
+            if transport_tx.send(pkt).await.is_err() { break; }
+            counters_send.bytes_out.fetch_add(len, Relaxed);
+        }
+    });
+    let _sender_guard = AbortOnDrop(sender_task);
 
     // Main TUN→server (upload) loop, interleaved with writing inbound packets.
     let mut rng = rand::rngs::StdRng::from_entropy();
@@ -722,30 +719,13 @@ async fn tunnel_loop(
                 match tun_result {
                     Ok(pkt) if !pkt.is_empty() => {
                         tun_read_errors = 0;
-                        let ciphertext = encrypt_packet(&keys, &pkt, *seq, None)
+                        let padded = seal_data_packet(keys, codec, &mut rng, *seq, &pkt, 16)
                             .context("encrypt failed")?;
-
-                        // Minimal padding: 2-byte header + 0-16 bytes random.
-                        // Full 512-byte padding kills throughput.
-                        let pad_len: u16 = rng.gen_range(0u16..16);
-                        let mut padded = Vec::with_capacity(2 + ciphertext.len() + 4 + pad_len as usize);
-                        let frame = Frame {
-                            seq: *seq,
-                            stream_id: 0,
-                            frame_type: FrameType::Data,
-                            flags: 0,
-                            payload: ciphertext,
-                            padding: vec![],
-                        };
-                        let encoded = codec.encode(&frame);
-                        padded.extend_from_slice(&pad_len.to_le_bytes());
-                        padded.extend_from_slice(&encoded);
-                        let pad: Vec<u8> = (0..pad_len).map(|_| rng.gen::<u8>()).collect();
-                        padded.extend_from_slice(&pad);
-
-                        let len = padded.len() as u64;
-                        if transport.send(padded).await.is_err() { break; }
-                        counters_out.bytes_out.fetch_add(len, Relaxed);
+                        match out_tx.try_send(padded) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                         *seq = seq.wrapping_add(1);
                     }
                     Ok(_) => {

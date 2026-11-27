@@ -13,7 +13,6 @@ use tokio_tungstenite::{
     },
     Connector,
 };
-use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
@@ -202,6 +201,14 @@ impl TransportConfig {
 /// Generate a 40-byte auth token: `timestamp_le(8) || HMAC-SHA256(secret, ts || [0u8;16])(32)`.
 /// Returns the token hex-encoded (80 hex chars).
 fn generate_auth_token(auth_secret: &[u8; 32]) -> String {
+    generate_auth_token_bytes(auth_secret)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// Raw 40-byte form of the auth token (see [`generate_auth_token`]).
+pub(crate) fn generate_auth_token_bytes(auth_secret: &[u8; 32]) -> [u8; 40] {
     use hmac::{Hmac, Mac};
 
     let ts = std::time::SystemTime::now()
@@ -224,8 +231,44 @@ fn generate_auth_token(auth_secret: &[u8; 32]) -> String {
     let mut token = [0u8; 40];
     token[..8].copy_from_slice(&ts_le);
     token[8..].copy_from_slice(&hmac_bytes);
+    token
+}
 
-    token.iter().map(|b| format!("{:02x}", b)).collect()
+/// Build the client-side rustls config honouring `danger_accept_invalid_certs`
+/// and certificate pinning. Shared by the WebSocket and QUIC transports.
+pub(crate) fn build_tls_client_config(cfg: &TransportConfig) -> rustls::ClientConfig {
+    // Idempotent: makes the library usable without the host binary installing a provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    if cfg.danger_accept_invalid_certs {
+        // Skip all cert verification — needed for self-signed server certificates.
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(DangerVerifier))
+            .with_no_client_auth()
+    } else if let Some(ref pin) = cfg.cert_pin {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(CertVerifier::new(
+                pin.clone(),
+                root_store,
+            )))
+            .with_no_client_auth()
+    } else {
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    }
+}
+
+async fn connect_tcp_nodelay(host: &str, port: u16) -> Result<tokio::net::TcpStream, HvpnError> {
+    let tcp = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| HvpnError::Transport(format!("tcp connect: {e}")))?;
+    let _ = tcp.set_nodelay(true);
+    Ok(tcp)
 }
 
 // ── WebSocketTransport ────────────────────────────────────────────────────────
@@ -259,7 +302,6 @@ impl WebSocketTransport {
     }
     /// Connect to `ws://host:port/path` without TLS (plain WebSocket).
     pub async fn connect_plain(cfg: &TransportConfig) -> Result<Self, HvpnError> {
-        use tokio_tungstenite::connect_async;
         let url = format!("ws://{}:{}{}", cfg.host, cfg.port, cfg.path);
 
         let mut request = url
@@ -286,7 +328,9 @@ impl WebSocketTransport {
         headers.insert("Accept-Language", "en-US,en;q=0.9".parse().unwrap());
         headers.insert("Cache-Control", "no-cache".parse().unwrap());
 
-        let (ws_stream, _response) = connect_async(request)
+        let tcp = connect_tcp_nodelay(&cfg.host, cfg.port).await?;
+        let (ws_stream, _response) =
+            tokio_tungstenite::client_async_tls_with_config(request, tcp, None, None)
             .await
             .map_err(|e| HvpnError::Transport(e.to_string()))?;
 
@@ -335,37 +379,20 @@ impl WebSocketTransport {
             headers.insert("X-Auth-Token", token_hex.parse().unwrap());
         }
 
-        // Build the rustls TLS connector.
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let tls_config = if cfg.danger_accept_invalid_certs {
-            // Skip all cert verification — needed for self-signed server certificates.
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(DangerVerifier))
-                .with_no_client_auth()
-        } else if let Some(ref pin) = cfg.cert_pin {
-            // Install a custom cert verifier that enforces fingerprint pinning.
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(CertVerifier::new(
-                    pin.clone(),
-                    root_store,
-                )))
-                .with_no_client_auth()
-        } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
-
+        let tls_config = build_tls_client_config(cfg);
         let connector = Connector::Rustls(Arc::new(tls_config));
 
-        let (ws_stream, _response) =
-            connect_async_tls_with_config(request, None, false, Some(connector))
-                .await
-                .map_err(|e| HvpnError::Transport(e.to_string()))?;
+        // Own TCP connect so TCP_NODELAY can be set (Nagle + delayed ACK add
+        // tens of ms of latency to small tunnelled packets).
+        let tcp = connect_tcp_nodelay(&cfg.host, cfg.port).await?;
+        let (ws_stream, _response) = tokio_tungstenite::client_async_tls_with_config(
+            request,
+            tcp,
+            None,
+            Some(connector),
+        )
+        .await
+        .map_err(|e| HvpnError::Transport(e.to_string()))?;
 
         Ok(Self::from_stream(ws_stream, None))
     }
